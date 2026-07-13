@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+dist/
+build/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# macOS / IDE
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
+
+# ── 真实环境 / 密钥（勿提交）──
+.env
+config.json
+config.local.json
+config.json.bak*
+
+# 邮箱凭证池（仅提交 *.example.txt）
+mail_credentials.txt
+custom_mail_credentials.txt
+*.credentials.txt
+
+# 账号账本与运行占用记录
+accounts_*.txt
+accounts_cli.txt
+emails_used.txt
+emails_error.txt
+created_mailboxes.txt
+cpa_auth_failed.txt
+
+# CPA OIDC 产出（目录保留 .gitkeep）
+cpa_auths/*
+!cpa_auths/.gitkeep
+
+# 浏览器 / 调试运行时
+cookies/
+screenshots/
+*.log
+*.bak
+*.tmp
