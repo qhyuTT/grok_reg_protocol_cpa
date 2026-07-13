@@ -57,18 +57,12 @@ def _patched_create_browser_options():
     except Exception:
         pass
 
-    for cand in (
-        "/usr/bin/chromium",
-        "/usr/bin/chromium-browser",
-        "/usr/bin/google-chrome",
-        "/usr/bin/google-chrome-stable",
-    ):
-        if os.path.isfile(cand):
-            try:
-                opts.set_browser_path(cand)
-            except Exception:
-                pass
-            break
+    try:
+        from chromium_paths import apply_browser_path
+
+        apply_browser_path(opts)
+    except Exception:
+        pass
 
     ext_path = os.path.join(os.path.dirname(os.path.abspath(reg.__file__)), "turnstilePatch")
     if os.path.isdir(ext_path):

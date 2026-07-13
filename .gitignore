@@ -40,6 +40,9 @@ emails_used.txt
 emails_error.txt
 created_mailboxes.txt
 cpa_auth_failed.txt
+cpa_auth_failed.jsonl
+**/cpa_auth_failed.jsonl
+**/backfill_failed.jsonl
 
 # CPA OIDC 产出（目录保留 .gitkeep）
 cpa_auths/*

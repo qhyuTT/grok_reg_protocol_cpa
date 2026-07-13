@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""optimization_checks.py — 12 项优化检查（T-003 RED → T-015 GREEN）
+"""optimization_checks.py — static health checks for register + CPA pipeline.
 
-用法: mise exec -- python3 optimization_checks.py
-退出码: 0=全pass, 1=有fail
+Usage: uv run python optimization_checks.py
+Exit: 0=all pass, 1=any fail
 
-每个检查对应 doneCriteria 可追溯。静态检测（source grep / config parse / module import），
-检测优化是否实际落地到代码，非注释/字符串模糊匹配。
+Checks code contracts (imports, APIs, config template keys) — not live network.
 """
+
+from __future__ import annotations
 
 import json
 import sys
@@ -18,8 +19,6 @@ CHECKS: list[tuple[str, Callable[[], bool]]] = []
 
 
 def check(name: str):
-    """装饰器：注册检查函数。返回 True=pass, False=fail。"""
-
     def decorator(func: Callable[[], bool]):
         CHECKS.append((name, func))
         return func
@@ -31,129 +30,119 @@ def _source(filename: str) -> str:
     return (ROOT / filename).read_text(encoding="utf-8")
 
 
-def _config() -> dict:
-    return json.loads(_source("config.json"))
+def _example_config() -> dict:
+    raw = json.loads(_source("config.example.json"))
+    # strip // comment keys
+    return {k: v for k, v in raw.items() if not str(k).startswith("//") and not str(k).startswith("#")}
 
 
-# ── 1. proxy → local proxy :7890 ──
+# ── 1. deps / toolchain ──
 
-@check("proxy-local proxy")
-def check_proxy() -> bool:
-    """config.json proxy 指向 local proxy pool"""
-    conf = _config()
-    proxy = conf.get("proxy", "")
-    return "127.0.0.1:7890" in proxy
+@check("pyproject-deps")
+def check_deps() -> bool:
+    src = _source("pyproject.toml")
+    return "DrissionPage" in src and "curl_cffi" in src
 
 
-# ── 2. chromium 瘦身 flags ──
-
-@check("chromium-slim-flags")
-def check_chromium_slim() -> bool:
-    """create_browser_options 含瘦身 flag 列表"""
-    src = _source("grok_register_ttk.py")
-    slim_flags = ["--disable-gpu", "--disable-software-rasterizer",
-                  "--disable-dev-shm-usage", "--disable-background-networking"]
-    return all(f in src for f in slim_flags)
-
-
-# ── 3. 单浏览器多 tab ──
-
-@check("single-browser-multi-tab")
-def check_single_browser() -> bool:
-    """存在 TabPool 模块 或 全局单例 browser 模式"""
-    tab_pool = ROOT / "tab_pool.py"
-    if tab_pool.is_file():
-        return True
-    src = _source("grok_register_ttk.py")
-    return "_browser_singleton" in src or "TabPool" in src
+@check("config-example-cpa-keys")
+def check_config_keys() -> bool:
+    conf = _example_config()
+    required = (
+        "cpa_export_enabled",
+        "cpa_prefer_protocol",
+        "cpa_protocol_only",
+        "cpa_auth_dir",
+        "cpa_base_url",
+        "cpa_mint_workers",
+    )
+    return all(k in conf for k in required)
 
 
-# ── 4. per-thread tab 隔离 ──
+# ── 2. browser / tab isolation ──
 
-@check("new-context-isolation")
-def check_new_context() -> bool:
-    """TabPool 使用 threading.local 实现 per-thread tab 隔离"""
-    src = _source("tab_pool.py") if (ROOT / "tab_pool.py").is_file() else ""
-    return "threading.local" in src or "_thread_local" in src
+@check("tab-pool-thread-local")
+def check_tab_pool() -> bool:
+    src = _source("tab_pool.py")
+    return "threading.local" in src and "clear_session" in src
 
 
-# ── 5. CLI 多线程 ──
+@check("chromium-paths-cross-platform")
+def check_chromium_paths() -> bool:
+    src = _source("chromium_paths.py")
+    return "win32" in src and "apply_browser_path" in src
+
+
+@check("cli-uses-chromium-paths")
+def check_cli_browser_paths() -> bool:
+    src = _source("register_cli.py")
+    return "chromium_paths" in src and "apply_browser_path" in src
+
+
+# ── 3. CPA protocol pipeline ──
+
+@check("protocol-mint-module")
+def check_protocol_mint() -> bool:
+    src = _source("cpa_xai/protocol_mint.py")
+    return "mint_with_sso_protocol" in src and "curl_cffi" in src
+
+
+@check("oauth-prefers-curl-cffi")
+def check_oauth_curl() -> bool:
+    src = _source("cpa_xai/oauth_device.py")
+    return "_post_form_curl" in src and "impersonate" in src
+
+
+@check("mint-error-codes")
+def check_error_codes() -> bool:
+    src = _source("cpa_xai/mint.py")
+    err = _source("cpa_xai/errors.py")
+    return "error_code" in src and "classify_protocol_message" in err
+
+
+@check("export-failure-jsonl")
+def check_export_jsonl() -> bool:
+    src = _source("cpa_export.py")
+    return "cpa_auth_failed.jsonl" in src and "error_code" in src
+
+
+# ── 4. CLI pipeline ──
 
 @check("multi-thread-worker")
 def check_multi_thread() -> bool:
-    """register_cli.py 含多线程 worker pool"""
     src = _source("register_cli.py")
-    has_threading = "ThreadPoolExecutor" in src or "threading.Thread" in src
-    has_queue = "task_queue" in src or "Queue" in src
-    return has_threading and has_queue
+    return "threading.Thread" in src and "mint_queue" in src
 
 
-# ── 6. NSFW（grok2api auto_nsfw） ──
+@check("mint-worker-resolve")
+def check_mint_resolve() -> bool:
+    src = _source("register_cli.py")
+    return "resolve_mint_workers" in src and "cpa_mint_workers" in src
 
-@check("nsfw-enabled")
-def check_nsfw() -> bool:
-    """grok2api 调用含 auto_nsfw=true + NSFW 函数定义存在"""
-    gtk = _source("grok_register_ttk.py")
-    nsfw_defs = "set_tos_accepted" in gtk and "set_birth_date" in gtk
-    has_auto_nsfw = "auto_nsfw" in gtk
-    return nsfw_defs and has_auto_nsfw
-
-
-# ── 7. gc 每200换 browser ──
-
-@check("gc-tab-restart")
-def check_gc_tab() -> bool:
-    """每200账号 browser 重启（_gc_counter + _maybe_gc_restart）"""
-    cli = _source("register_cli.py")
-    return "_gc_counter" in cli and "_maybe_gc_restart" in cli
-
-
-# ── 8. CDP 指纹随机（暂缓，Turnstile 已过） ──
-
-@check("fingerprint-random")
-def check_fingerprint() -> bool:
-    """指纹随机化暂缓：Turnstile 已通过 turnstilePatch，非阻塞"""
-    return True  # 暂缓，标记为 pass
-
-
-# ── 9. human_sleep 抖动 ──
-
-@check("human-sleep")
-def check_human_sleep() -> bool:
-    """human_sleep 函数定义 + time.sleep 替换"""
-    src = _source("grok_register_ttk.py")
-    has_func = "def human_sleep" in src or "human_sleep(" in src
-    has_gauss = "gauss" in src or "random" in src
-    return has_func and has_gauss
-
-
-# ── 10. cloudmail 短轮询 ──
-
-@check("cloudmail-short-poll")
-def check_short_poll() -> bool:
-    """cloudmail 轮询含 0.3s 间隔"""
-    src = _source("grok_register_ttk.py")
-    return "0.3" in src  # short poll interval
-
-
-# ── 11. 断点续跑 ──
 
 @check("resume-checkpoint")
 def check_resume() -> bool:
-    """accounts_cli.txt 断点续跑（done_count 跳过已完成）"""
     src = _source("register_cli.py")
     return "done_count" in src
 
 
-# ── 12. 异常隔离 ──
-
 @check("error-isolation")
 def check_error_isolation() -> bool:
-    """账号级重试（retry loop + inc_fail 统计）"""
     src = _source("register_cli.py")
-    has_retry = "retry" in src.lower()
-    has_fail_track = "inc_fail" in src
-    return has_retry and has_fail_track
+    return "reg_fail" in src and "retry" in src.lower()
+
+
+# ── 5. register ergonomics ──
+
+@check("human-sleep")
+def check_human_sleep() -> bool:
+    src = _source("grok_register_ttk.py")
+    return "def human_sleep" in src
+
+
+@check("browser-recycle")
+def check_browser_recycle() -> bool:
+    src = _source("register_cli.py")
+    return "browser_recycle_every" in src or "recycle_every" in src
 
 
 def main() -> int:

@@ -220,12 +220,32 @@ def export_cpa_xai_for_account(
             log(f"[cpa] hotload copy failed: {e}")
             result["cpa_copy_error"] = str(e)
 
-    # failure log under register dir
+    # failure log under register dir (legacy line + structured JSONL)
     if not result.get("ok"):
+        from cpa_xai.errors import append_failure_jsonl, classify_export_error  # type: ignore
+
+        err_msg = result.get("error") or "unknown"
+        err_code = result.get("error_code") or classify_export_error(
+            str(err_msg), mint_method=result.get("mint_method")
+        )
+        result["error_code"] = err_code
         fail_path = out_dir / "cpa_auth_failed.txt"
         with open(fail_path, "a", encoding="utf-8") as f:
-            f.write(f"{email}----{result.get('error') or 'unknown'}----{int(time.time())}\n")
+            f.write(f"{email}----{err_msg}----{int(time.time())}----{err_code}\n")
+        append_failure_jsonl(
+            out_dir / "cpa_auth_failed.jsonl",
+            {
+                "email": email,
+                "error": err_msg,
+                "error_code": err_code,
+                "mint_method": result.get("mint_method"),
+                "protocol_error": result.get("protocol_error"),
+                "protocol_error_code": result.get("protocol_error_code"),
+                "path": result.get("path"),
+            },
+        )
+        log(f"[cpa] fail error_code={err_code}")
         if cfg.get("cpa_mint_required", False):
-            raise RuntimeError(f"CPA mint required but failed: {result.get('error')}")
+            raise RuntimeError(f"CPA mint required but failed: {err_msg}")
 
     return result

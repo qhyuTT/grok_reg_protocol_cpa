@@ -131,6 +131,19 @@ your@hotmail.com----mailPassword----xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx----0.AX
 [cpa] mint_method=browser
 ```
 
+### 失败归因（结构化）
+
+mint 失败会同时写：
+
+| 文件 | 格式 |
+|------|------|
+| `cpa_auths/cpa_auth_failed.txt` | `email----error----ts----error_code`（兼容旧三字段） |
+| `cpa_auths/cpa_auth_failed.jsonl` | 每行 JSON：`email` / `error_code` / `mint_method` / `protocol_error_code` |
+
+常见 `error_code`：`PROTOCOL_VERIFY`、`PROTOCOL_APPROVE`、`PROTOCOL_TOKEN`、`PROTOCOL_SSO_INVALID`、`BROWSER_FAIL`、`PROBE_NO_GROK45`、`PROTOCOL_ONLY_FAIL`。
+
+device-code / token 轮询优先走 **curl_cffi（Chrome TLS）**，与协议 verify/approve 一致；无 curl_cffi 时回退 stdlib urllib。
+
 ---
 
 ## 整链示意

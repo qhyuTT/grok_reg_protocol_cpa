@@ -216,18 +216,18 @@ def create_standalone_page(
             pass
         log(f"headed browser DISPLAY={os.environ.get('DISPLAY', '')!r}")
 
-    for cand in (
-        "/usr/bin/chromium",
-        "/usr/bin/chromium-browser",
-        "/usr/bin/google-chrome",
-        "/usr/bin/google-chrome-stable",
-    ):
-        if os.path.isfile(cand):
-            try:
-                opts.set_browser_path(cand)
-            except Exception:
-                pass
-            break
+    try:
+        # Project-root helper (Windows/macOS/Linux Chrome paths)
+        _root = str(Path(__file__).resolve().parents[1])
+        if _root not in sys.path:
+            sys.path.insert(0, _root)
+        from chromium_paths import apply_browser_path  # type: ignore
+
+        path = apply_browser_path(opts)
+        if path:
+            log(f"browser path={path}")
+    except Exception:
+        pass
 
     from .proxyutil import proxy_for_chromium, proxy_log_label, resolve_proxy
 
