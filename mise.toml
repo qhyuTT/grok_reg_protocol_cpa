@@ -18,8 +18,16 @@ description = "用 uv 同步依赖（按 uv.lock 精确版本）"
 
 # ─── 语法检查 ───
 [tasks.check]
-run = "python -m py_compile grok_register_ttk.py register_cli.py cf_mail_debug.py"
+run = "python -m py_compile grok_register_ttk.py register_cli.py cf_mail_debug.py cpa_export.py cpa_xai/mint.py cpa_xai/oauth_device.py cpa_xai/protocol_mint.py chromium_paths.py"
 description = "全模块语法检查"
+
+[tasks.test]
+run = "python -m unittest discover -s tests -v"
+description = "跑单元测试（custom_mail + cpa_xai 纯函数）"
+
+[tasks.optimize-check]
+run = "python optimization_checks.py"
+description = "静态健康检查（协议 mint / 错误码 / TabPool 等契约）"
 
 # ─── 注册运行 ───
 # 用法:

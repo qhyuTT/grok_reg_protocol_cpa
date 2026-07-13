@@ -6,6 +6,16 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .browser_confirm import mint_with_browser
+from .errors import (
+    BROWSER_FAIL,
+    MISSING_CREDENTIALS,
+    MISSING_EMAIL,
+    PROBE_CHAT_FAIL,
+    PROBE_NO_GROK45,
+    PROTOCOL_ONLY_FAIL,
+    PROTOCOL_ONLY_NO_SSO,
+    classify_protocol_message,
+)
 from .probe import probe_mini_response, probe_models
 from .protocol_mint import ProtocolMintError, extract_sso_from_cookies, mint_with_sso_protocol
 from .proxyutil import proxy_log_label, resolve_proxy, set_runtime_proxy
@@ -48,16 +58,26 @@ def mint_and_export(
     and an sso cookie is available. On failure, falls back to browser mint unless
     protocol_only=True.
 
-    Returns dict with keys: ok, path, email, probe, error?, mint_method?
+    Returns dict with keys: ok, path, email, probe, error?, error_code?, mint_method?
     """
     log = log or _noop
     email = (email or "").strip()
     if not email or not password:
         # Protocol can work with sso alone; password only required for browser fallback
         if not email:
-            return {"ok": False, "email": email, "error": "missing email"}
+            return {
+                "ok": False,
+                "email": email,
+                "error": "missing email",
+                "error_code": MISSING_EMAIL,
+            }
         if not (sso or extract_sso_from_cookies(cookies)):
-            return {"ok": False, "email": email, "error": "missing email/password"}
+            return {
+                "ok": False,
+                "email": email,
+                "error": "missing email/password",
+                "error_code": MISSING_CREDENTIALS,
+            }
 
     # Config/explicit proxy wins over shell https_proxy (common 7890 trap).
     # Thread-local pin — safe under concurrent mint workers.
@@ -68,6 +88,7 @@ def mint_and_export(
     sso_val = (sso or "").strip() or extract_sso_from_cookies(cookies)
     tokens: dict[str, Any] | None = None
     protocol_err: str | None = None
+    protocol_err_code: str | None = None
 
     if prefer_protocol and sso_val:
         log("mint try protocol (SSO HTTP device flow)")
@@ -83,23 +104,31 @@ def mint_and_export(
             log("mint protocol SUCCESS")
         except ProtocolMintError as e:
             protocol_err = str(e)
+            protocol_err_code = classify_protocol_message(protocol_err)
             log(f"mint protocol failed: {e}")
             if protocol_only:
                 return {
                     "ok": False,
                     "email": email,
                     "error": f"protocol_only: {e}",
+                    "error_code": PROTOCOL_ONLY_FAIL,
+                    "protocol_error": protocol_err,
+                    "protocol_error_code": protocol_err_code,
                     "mint_method": "protocol",
                 }
             log("mint fallback → browser")
         except Exception as e:  # noqa: BLE001
             protocol_err = str(e)
+            protocol_err_code = classify_protocol_message(protocol_err)
             log(f"mint protocol exception: {e}")
             if protocol_only:
                 return {
                     "ok": False,
                     "email": email,
                     "error": f"protocol_only: {e}",
+                    "error_code": PROTOCOL_ONLY_FAIL,
+                    "protocol_error": protocol_err,
+                    "protocol_error_code": protocol_err_code,
                     "mint_method": "protocol",
                 }
             log("mint fallback → browser")
@@ -110,6 +139,7 @@ def mint_and_export(
                 "ok": False,
                 "email": email,
                 "error": "protocol_only but no sso cookie",
+                "error_code": PROTOCOL_ONLY_NO_SSO,
                 "mint_method": "protocol",
             }
     elif not prefer_protocol:
@@ -121,7 +151,9 @@ def mint_and_export(
                 "ok": False,
                 "email": email,
                 "error": protocol_err or "protocol failed and no password for browser fallback",
+                "error_code": protocol_err_code or MISSING_CREDENTIALS,
                 "protocol_error": protocol_err,
+                "protocol_error_code": protocol_err_code,
             }
         try:
             tokens = mint_with_browser(
@@ -141,6 +173,7 @@ def mint_and_export(
             tokens["mint_method"] = "browser"
             if protocol_err:
                 tokens["protocol_error"] = protocol_err
+                tokens["protocol_error_code"] = protocol_err_code
         except Exception as e:  # noqa: BLE001
             log(f"mint failed: {e}")
             err = str(e)
@@ -150,7 +183,10 @@ def mint_and_export(
                 "ok": False,
                 "email": email,
                 "error": err,
+                "error_code": BROWSER_FAIL,
                 "protocol_error": protocol_err,
+                "protocol_error_code": protocol_err_code,
+                "mint_method": "browser",
             }
 
     payload = build_cpa_xai_auth(
@@ -175,6 +211,8 @@ def mint_and_export(
     }
     if protocol_err and result["mint_method"] != "protocol":
         result["protocol_error"] = protocol_err
+        if protocol_err_code:
+            result["protocol_error_code"] = protocol_err_code
 
     if probe:
         pr = probe_models(tokens["access_token"], base_url=base_url, proxy=resolved or None)
@@ -187,6 +225,7 @@ def mint_and_export(
         if not pr.get("has_grok_45"):
             result["ok"] = False
             result["error"] = "token ok but grok-4.5 not listed"
+            result["error_code"] = PROBE_NO_GROK45
         if probe_chat and pr.get("has_grok_45"):
             ch = probe_mini_response(
                 tokens["access_token"], base_url=base_url, proxy=resolved or None
@@ -196,4 +235,5 @@ def mint_and_export(
             if not ch.get("ok"):
                 result["ok"] = False
                 result["error"] = f"chat probe failed: {ch.get('error') or ch.get('status')}"
+                result["error_code"] = PROBE_CHAT_FAIL
     return result

@@ -2,128 +2,166 @@
 
 ## 环境要求
 
-- macOS 或带桌面环境的 Linux
-- Python 3.13
-- `uv`
-- Google Chrome 或 Chromium
-- 可访问 xAI 服务的代理
+| 项 | 要求 |
+|----|------|
+| 系统 | Windows / macOS / 带桌面的 Linux |
+| Python | **3.13**（见 `pyproject.toml`） |
+| 工具 | [`uv`](https://github.com/astral-sh/uv)；可选 [`mise`](https://mise.jdx.dev/) |
+| 浏览器 | Google Chrome / Chromium / Edge（注册 + 协议失败回退时） |
+| 代理 | 能访问 `accounts.x.ai` / `auth.x.ai` / `cli-chat-proxy.grok.com` |
 
-本机当前代理来自 `~/.zshrc`：
+说明：
 
-```text
-http://192.168.31.206:7890
-```
-
-项目的 `config.json` 中，`proxy` 和 `cpa_proxy` 均应使用该地址。修改配置后，需要关闭并重新启动正在运行的 GUI。
+- **协议 CPA mint**（`cpa_prefer_protocol=true` 且有 SSO）纯 HTTP，不弹浏览器。  
+- **注册流程**与协议失败回退仍需要本机 Chromium；路径由 `chromium_paths.py` 自动探测（含 Windows）。
 
 ## 首次启动
 
-进入项目目录并安装依赖：
+在项目根目录：
 
 ```bash
-cd /Users/nameqhyu/WorkSpace/grok_reg-protocol_cpa
+# 克隆后
+cd grok_reg_protocol_cpa
+
+# 安装依赖（按 uv.lock）
 uv sync
-```
 
-验证核心依赖：
-
-```bash
+# 验证核心库
 uv run python -c "from DrissionPage import Chromium; from curl_cffi import requests; print('OK')"
 ```
 
-## 启动 GUI
+可选 mise：
 
 ```bash
-cd /Users/nameqhyu/WorkSpace/grok_reg-protocol_cpa
-uv run python grok_register_ttk.py
+mise install
+mise run deps
+mise run test
+mise run optimize-check
 ```
 
-GUI 进程会持续占用当前终端。关闭窗口或在终端按 `Ctrl+C` 即可停止。
-
-## 使用 CLI 注册
-
-注册 1 个账号，单线程运行：
+## 配置
 
 ```bash
-cd /Users/nameqhyu/WorkSpace/grok_reg-protocol_cpa
-uv run python -u register_cli.py --extra 1 --threads 1
+cp config.example.json config.json
 ```
 
-批量注册时可调整 `--extra` 和 `--threads`，但不建议一开始使用过高并发。
-
-## 使用 CustomMail 自有域名邮箱
-
-CustomMail 适用于“Cloudflare Email Routing Catch-all → Gmail”链路。先复制凭证模板：
-
-```bash
-cp custom_mail_credentials.example.txt custom_mail_credentials.txt
-```
-
-每行填写一个域名路由，格式如下：
-
-```text
-自有域名----Gmail收件箱----Gmail应用专用密码
-```
-
-然后在 GUI 中选择 `custommail`，或在 `config.json` 设置：
+至少检查：
 
 ```json
 {
-  "email_provider": "custommail",
-  "custom_mail_accounts_file": "custom_mail_credentials.txt"
+  "proxy": "http://127.0.0.1:7890",
+  "cpa_proxy": "http://127.0.0.1:7890",
+  "email_provider": "hotmail",
+  "cpa_export_enabled": true,
+  "cpa_prefer_protocol": true,
+  "cpa_auth_dir": "./cpa_auths",
+  "cpa_base_url": "https://cli-chat-proxy.grok.com/v1"
 }
 ```
 
-Cloudflare 不需要 API key，但必须事先完成域名邮件路由和 Gmail 目标地址验证。Gmail 需要开启两步验证并使用应用专用密码；不要使用普通登录密码。程序会生成 `reg000001@你的域名` 一类顺序地址，并按原始收件地址和 xAI 发件域名匹配验证码。
+代理优先级：`cpa_proxy` > `proxy` > 环境变量 `https_proxy` / `http_proxy`。  
+修改 `config.json` 后需**重启** GUI 或重新跑 CLI 才会生效。
 
-## 启动前检查
+字段详解见 `config.example.json` 内 `//` 注释键。
 
-### 配置文件
+## 邮箱凭证（按 provider）
 
-确认 `config.json` 存在且至少检查以下字段：
-
-```json
-{
-  "proxy": "http://192.168.31.206:7890",
-  "cpa_proxy": "http://192.168.31.206:7890",
-  "email_provider": "hotmail"
-}
-```
-
-### Hotmail 凭证
-
-当 `email_provider` 为 `hotmail` 时，必须创建 `mail_credentials.txt`：
+### Hotmail / Outlook
 
 ```bash
 cp mail_credentials.example.txt mail_credentials.txt
 ```
 
-然后按以下格式填写真实凭证，每个账号一行：
+每行四段：
 
 ```text
 邮箱----密码----ClientID----Token
 ```
 
-不要提交包含真实凭证的文件。
+`Token` 为 Microsoft OAuth **refresh_token**（IMAP XOAUTH2）。  
+`config.json` 中：`"email_provider": "hotmail"`。
 
-### 代理连通性
-
-检查代理端口是否可达：
+### CustomMail（自有域名 → Gmail）
 
 ```bash
-nc -vz 192.168.31.206 7890
+cp custom_mail_credentials.example.txt custom_mail_credentials.txt
 ```
 
-通过代理测试 HTTPS：
+每行三段：
+
+```text
+自有域名----Gmail收件箱----Gmail应用专用密码
+```
+
+`config.json` 中：`"email_provider": "custommail"`。  
+完整无 GUI 说明见 [`CUSTOMMAIL_CLI.md`](CUSTOMMAIL_CLI.md)。
+
+**不要提交**含真实凭证的文件（已在 `.gitignore`）。
+
+## 启动 GUI
 
 ```bash
-curl -I --proxy http://192.168.31.206:7890 https://accounts.x.ai
+uv run python grok_register_ttk.py
+# 或
+mise run gui
+```
+
+关闭窗口或终端 `Ctrl+C` 停止。
+
+## 使用 CLI 注册（推荐）
+
+```bash
+# 再注册 1 个，单线程
+uv run python -u register_cli.py --extra 1 --threads 1
+
+# 再注册 5 个，2 注册线程（mint 并发由 config / --mint-workers 决定）
+uv run python -u register_cli.py --extra 5 --threads 2
+```
+
+成功时默认会：
+
+1. 追加账本 `accounts_cli.txt`：`email----password----sso`  
+2. 可选推 grok2api  
+3. 协议优先 mint → `cpa_auths/xai-<email>.json`（失败回退浏览器）
+
+常用参数：
+
+| 参数 | 含义 |
+|------|------|
+| `--extra N` | 再新注册 N 个 |
+| `--threads N` | 注册并发 |
+| `--mint-workers N` | mint 并发；`0`=内联；`-1`=auto |
+| `--fast` / `--no-fast` | 快速模式（默认开） |
+
+## 代理连通性
+
+把地址换成你的代理：
+
+```bash
+# Windows PowerShell 示例
+curl.exe -I --proxy http://127.0.0.1:7890 https://accounts.x.ai
+
+# Linux / macOS
+curl -I --proxy http://127.0.0.1:7890 https://accounts.x.ai
+```
+
+## 测试与检查
+
+```bash
+uv run python -m unittest discover -s tests -v
+uv run python optimization_checks.py
 ```
 
 ## 常见问题
 
-- 提示找不到 `mail_credentials.txt`：按上文复制模板并填写真实 Hotmail OAuth 凭证。
-- 代理连接失败：确认代理设备 IP 未变化、代理程序正在监听 `7890`，并允许局域网连接。
-- 修改 `config.json` 后未生效：完全退出 GUI 后重新运行启动命令。
-- 注册成功但远端导入失败：`grok2api_auto_add_remote` 启用时，还需要启动 `config.json` 指向的 grok2api 服务并配置有效的 app key；不使用该功能时可将其关闭。
-- 浏览器无法启动：确认 Google Chrome/Chromium 已安装，并避免已有调试端口冲突。
+| 问题 | 处理 |
+|------|------|
+| 找不到 `mail_credentials.txt` | 复制 example 并填四段 Hotmail 凭证 |
+| 找不到 CustomMail 凭证 | 复制 `custom_mail_credentials.example.txt` |
+| 代理失败 | 确认本地/局域网代理在听端口，config 与环境变量一致 |
+| 改 config 不生效 | 完全退出 GUI / 重跑 CLI |
+| 注册成功但无 CPA 文件 | 查 `cpa_export_enabled`；看 `cpa_auths/cpa_auth_failed.txt` 与 `.jsonl` 的 `error_code` |
+| Windows 浏览器起不来 | 安装 Chrome 或 Edge；无需手写 `/usr/bin/chromium` |
+| grok2api 远端导入失败 | 关 `grok2api_auto_add_remote`，或启动对应 Admin API 并配 app key |
+
+更完整的链路、错误码与目录说明见 [`README.md`](README.md)。

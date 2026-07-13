@@ -106,15 +106,57 @@ def _is_transient_net_error(exc: BaseException) -> bool:
     return False
 
 
-def _post_form(
+def _parse_body(status: int, text: str) -> tuple[int, dict[str, Any] | str]:
+    try:
+        return int(status), json.loads(text)
+    except json.JSONDecodeError:
+        return int(status), text
+
+
+def _post_form_curl(
     url: str,
     form: dict[str, str],
-    timeout: float = 30.0,
+    timeout: float,
     *,
-    proxy: str | None = None,
-    retries: int = 0,
-    retry_sleep: float = 1.5,
+    proxy: str | None,
 ) -> tuple[int, dict[str, Any] | str]:
+    """Preferred path: curl_cffi Chrome TLS fingerprint (matches protocol_mint)."""
+    from curl_cffi import requests as cf_requests
+
+    proxies = None
+    p = resolve_proxy(proxy)
+    if p:
+        proxies = {"http": p, "https": p}
+    r = cf_requests.post(
+        url,
+        data=form,
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "application/json",
+            "User-Agent": "grok-reg-cpa-xai-minter/1.0",
+        },
+        proxies=proxies,
+        timeout=timeout,
+        impersonate="chrome",
+        allow_redirects=True,
+    )
+    text = getattr(r, "text", None) or ""
+    if not text and getattr(r, "content", None):
+        try:
+            text = r.content.decode("utf-8", errors="replace")
+        except Exception:
+            text = ""
+    return _parse_body(int(getattr(r, "status_code", 0) or 0), text)
+
+
+def _post_form_urllib(
+    url: str,
+    form: dict[str, str],
+    timeout: float,
+    *,
+    proxy: str | None,
+) -> tuple[int, dict[str, Any] | str]:
+    """Fallback when curl_cffi is unavailable."""
     data = urllib.parse.urlencode(form).encode("utf-8")
     req = urllib.request.Request(
         url,
@@ -126,24 +168,44 @@ def _post_form(
             "User-Agent": "grok-reg-cpa-xai-minter/1.0",
         },
     )
+    opener = _opener(proxy)
+    try:
+        with opener.open(req, timeout=timeout) as resp:
+            body = resp.read().decode("utf-8", errors="replace")
+            status = getattr(resp, "status", 200) or 200
+            return _parse_body(int(status), body)
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")
+        return _parse_body(int(e.code), body)
+
+
+def _post_form(
+    url: str,
+    form: dict[str, str],
+    timeout: float = 30.0,
+    *,
+    proxy: str | None = None,
+    retries: int = 0,
+    retry_sleep: float = 1.5,
+) -> tuple[int, dict[str, Any] | str]:
+    """POST form-urlencoded JSON API. Prefer curl_cffi; fall back to urllib."""
     last: BaseException | None = None
     attempts = max(int(retries), 0) + 1
+    use_curl = True
+    try:
+        import curl_cffi  # noqa: F401
+    except ImportError:
+        use_curl = False
+
     for i in range(attempts):
-        opener = _opener(proxy)
         try:
-            with opener.open(req, timeout=timeout) as resp:
-                body = resp.read().decode("utf-8", errors="replace")
-                status = getattr(resp, "status", 200) or 200
+            if use_curl:
                 try:
-                    return int(status), json.loads(body)
-                except json.JSONDecodeError:
-                    return int(status), body
-        except urllib.error.HTTPError as e:
-            body = e.read().decode("utf-8", errors="replace")
-            try:
-                return int(e.code), json.loads(body)
-            except json.JSONDecodeError:
-                return int(e.code), body
+                    return _post_form_curl(url, form, timeout, proxy=proxy)
+                except ImportError:
+                    use_curl = False
+                    return _post_form_urllib(url, form, timeout, proxy=proxy)
+            return _post_form_urllib(url, form, timeout, proxy=proxy)
         except BaseException as e:  # noqa: BLE001
             last = e
             if not _is_transient_net_error(e) or i + 1 >= attempts:

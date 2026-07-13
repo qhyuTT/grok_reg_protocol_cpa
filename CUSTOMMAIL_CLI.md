@@ -22,7 +22,7 @@ CustomMail **不需要** Cloudflare API Key。链路是：
 
 ```
 xAI 发验证码
-  → 自有域名邮箱（如 swcares000001@你的域名）
+  → 自有域名邮箱（如 reg000001@你的域名）
   → Cloudflare Email Routing Catch-all 转发
   → Gmail 收件箱
   → 本程序用 Gmail「应用专用密码」走 IMAP 拉取验证码
@@ -37,7 +37,7 @@ xAI 发验证码
 ...
 ```
 
-默认前缀是 `reg`；本机当前配置可用 `swcares` 等自定义前缀。
+默认前缀是 `reg`；可通过 `custom_mail_address_prefix` 自定义。
 
 ---
 
@@ -45,9 +45,9 @@ xAI 发验证码
 
 | 项 | 要求 |
 |----|------|
-| 系统 | macOS 或带桌面的 Linux（注册仍要开 Chromium；协议 CPA mint 可不弹浏览器） |
+| 系统 | Windows / macOS / 带桌面的 Linux（注册仍要开 Chromium；协议 CPA mint 可不弹浏览器） |
 | Python | 3.13 + `uv` |
-| 浏览器 | Google Chrome / Chromium |
+| 浏览器 | Google Chrome / Chromium / Edge（路径自动探测） |
 | 代理 | 能访问 `accounts.x.ai` / `auth.x.ai`（写在 `config.json`） |
 | 域名 | 已在 Cloudflare 托管，并开启 **Email Routing** |
 | 转发 | Catch-all（或对应规则）转发到你的 Gmail |
@@ -71,7 +71,7 @@ xAI 发验证码
 ## 3. 首次环境
 
 ```bash
-cd /Users/nameqhyu/WorkSpace/grok_reg-protocol_cpa
+cd /path/to/grok_reg_protocol_cpa
 
 # 安装依赖
 uv sync
@@ -80,13 +80,11 @@ uv sync
 uv run python -c "from DrissionPage import Chromium; from curl_cffi import requests; print('OK')"
 ```
 
-可选代理连通性检查（按你本机代理改 IP/端口）：
+可选代理连通性检查（把地址换成你的代理）：
 
 ```bash
-nc -vz 192.168.31.206 7890
-curl -I --proxy http://192.168.31.206:7890 https://accounts.x.ai
+curl -I --proxy http://127.0.0.1:7890 https://accounts.x.ai
 ```
-
 ---
 
 ## 4. 准备凭证文件（必做）
@@ -94,10 +92,9 @@ curl -I --proxy http://192.168.31.206:7890 https://accounts.x.ai
 ### 4.1 复制模板
 
 ```bash
-cd /Users/nameqhyu/WorkSpace/grok_reg-protocol_cpa
+cd /path/to/grok_reg_protocol_cpa
 cp custom_mail_credentials.example.txt custom_mail_credentials.txt
 ```
-
 ### 4.2 编辑 `custom_mail_credentials.txt`
 
 **每行一条路由**，三段，`----` 分隔：
@@ -141,15 +138,15 @@ cp config.example.json config.json
 {
   "email_provider": "custommail",
   "custom_mail_accounts_file": "custom_mail_credentials.txt",
-  "custom_mail_address_prefix": "swcares",
+  "custom_mail_address_prefix": "reg",
   "custom_mail_max_addresses_per_account": 100,
   "custom_mail_poll_interval": 5,
   "custom_mail_recent_seconds": 900,
   "custom_mail_imap_last_n": 50,
   "custom_mail_allowed_sender_domains": "x.ai,grok.com",
 
-  "proxy": "http://192.168.31.206:7890",
-  "cpa_proxy": "http://192.168.31.206:7890",
+  "proxy": "http://127.0.0.1:7890",
+  "cpa_proxy": "http://127.0.0.1:7890",
 
   "cpa_export_enabled": true,
   "cpa_prefer_protocol": true,
@@ -158,13 +155,14 @@ cp config.example.json config.json
 }
 ```
 
+
 ### 字段速查
 
 | 字段 | 作用 | 建议 |
 |------|------|------|
 | `email_provider` | 必须是 `custommail`（也认 `custom_mail`） | 必填 |
 | `custom_mail_accounts_file` | 凭证文件路径（相对项目根） | 默认即可 |
-| `custom_mail_address_prefix` | 地址前缀，生成 `前缀000001@域名` | 如 `swcares` / `reg` |
+| `custom_mail_address_prefix` | 地址前缀，生成 `前缀000001@域名` | 如 `reg` |
 | `custom_mail_max_addresses_per_account` | 每条凭证最多分配多少个地址 | 按域名容量设 |
 | `custom_mail_poll_interval` | IMAP 轮询间隔（秒） | 5 |
 | `custom_mail_recent_seconds` | 只读最近 N 秒邮件，防读到旧码 | 900 |
@@ -182,9 +180,10 @@ cp config.example.json config.json
 ### 6.1 再注册 1 个号（最常用）
 
 ```bash
-cd /Users/nameqhyu/WorkSpace/grok_reg-protocol_cpa
+cd /path/to/grok_reg_protocol_cpa
 uv run python -u register_cli.py --extra 1 --threads 1
 ```
+
 
 ### 6.2 批量再注册 N 个
 
@@ -278,7 +277,7 @@ uv run python -m unittest tests.test_custom_mail -v
 | 读到旧码 / 错码 | 调大/确认 `custom_mail_recent_seconds`；并发时依赖收件人匹配 |
 | 地址耗尽 | 提高 `custom_mail_max_addresses_per_account`，或加新凭证行 |
 | 代理失败 | `proxy` / `cpa_proxy` 是否可达；改完配置后重新跑 CLI |
-| 注册成功但无 `cpa_auths` | `cpa_export_enabled` 是否 true；看日志 `[cpa]` 与 `cpa_auth_failed.txt` |
+| 注册成功但无 `cpa_auths` | `cpa_export_enabled` 是否 true；看日志 `[cpa]` 与 `cpa_auth_failed.txt` / `.jsonl` 的 `error_code` |
 | provider 不是 CustomMail | `config.json` 里 `email_provider` 必须为 `custommail` |
 
 调试原则：
@@ -292,17 +291,17 @@ uv run python -m unittest tests.test_custom_mail -v
 ## 11. 最小检查清单（复制即用）
 
 ```bash
-cd /Users/nameqhyu/WorkSpace/grok_reg-protocol_cpa
+cd /path/to/grok_reg_protocol_cpa
 
 # 1) 依赖
 uv sync
 
 # 2) 凭证（若尚未创建）
-cp -n custom_mail_credentials.example.txt custom_mail_credentials.txt
+cp custom_mail_credentials.example.txt custom_mail_credentials.txt
 # 编辑 custom_mail_credentials.txt → 域名----Gmail----应用专用密码
 
 # 3) 配置（若尚未创建）
-cp -n config.example.json config.json
+cp config.example.json config.json
 # 编辑 config.json：
 #   "email_provider": "custommail"
 #   "custom_mail_accounts_file": "custom_mail_credentials.txt"
@@ -313,7 +312,9 @@ cp -n config.example.json config.json
 uv run python -u register_cli.py --extra 1 --threads 1
 
 # 5) 检查产物
+# Windows: dir accounts_cli.txt cpa_auths
 ls -l accounts_cli.txt cpa_auths/ 2>/dev/null
+
 tail -n 3 accounts_cli.txt 2>/dev/null
 ```
 
