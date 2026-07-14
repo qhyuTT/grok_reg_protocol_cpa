@@ -7,9 +7,12 @@ points at a directory that *contains* the `cpa_xai` package.
 
 from __future__ import annotations
 
+import json
 import os
+import re
 import shutil
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -17,6 +20,113 @@ from typing import Any, Callable
 _REG_DIR = Path(__file__).resolve().parent
 _DEFAULT_OUT = _REG_DIR / "cpa_auths"
 _DEFAULT_CPA = Path("")  # empty = do not assume a machine-local CPA path
+_health_audit_lock = threading.Lock()
+
+
+def _parse_health_delays(value: Any) -> list[float]:
+    if isinstance(value, str):
+        values = [item.strip() for item in value.split(",") if item.strip()]
+    elif isinstance(value, (list, tuple)):
+        values = list(value)
+    else:
+        values = [0, 15, 45]
+    parsed = []
+    for item in values:
+        try:
+            parsed.append(max(0.0, float(item)))
+        except (TypeError, ValueError):
+            continue
+    return sorted(set(parsed)) or [0.0, 15.0, 45.0]
+
+
+def _redact_audit_text(value: Any, limit: int = 500) -> str:
+    text = str(value or "")
+    # Redact before truncation. Otherwise a long JWT can be cut mid-signature
+    # and no longer match the three-segment pattern, leaking its prefix.
+    text = re.sub(
+        r"[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}",
+        "<redacted:jwt>",
+        text,
+    )
+    text = re.sub(
+        r'''(?ix)
+        (\b(?:access_token|refresh_token|id_token|authorization|sso(?:-rw)?|token)\b
+        ["']?\s*[:=]\s*["']?(?:bearer\s+)?)
+        [^\s,"';&}]+
+        ''',
+        r"\1<redacted>",
+        text,
+    )
+    text = re.sub(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", "<redacted:email>", text)
+    return text[:limit]
+
+
+def _health_attempt_for_audit(item: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "attempt": item.get("attempt"),
+        "offset_sec": item.get("offset_sec"),
+        "classification": item.get("classification"),
+        "confidence": item.get("confidence"),
+        "model": item.get("model"),
+        "models_status": item.get("models_status"),
+        "responses_status": item.get("http_status"),
+        "responses_code": item.get("error_code"),
+        "responses_message": _redact_audit_text(item.get("error_message")),
+        "responses_content_type": item.get("responses_content_type"),
+        "responses_duration_ms": item.get("responses_duration_ms"),
+        "responses_raw_snippet": _redact_audit_text(item.get("responses_raw_snippet")),
+        "fallback_status": item.get("fallback_status"),
+        "fallback_code": item.get("fallback_error_code"),
+        "fallback_message": _redact_audit_text(item.get("fallback_error_message")),
+        "fallback_content_type": item.get("fallback_content_type"),
+        "fallback_duration_ms": item.get("fallback_duration_ms"),
+        "fallback_raw_snippet": _redact_audit_text(item.get("fallback_raw_snippet")),
+    }
+
+
+def _write_health_audit(
+    *,
+    result: dict[str, Any],
+    email: str,
+    cfg: dict[str, Any],
+    log: Callable[[str], None],
+) -> None:
+    health = result.get("health")
+    if not isinstance(health, dict):
+        return
+    raw_path = str(
+        cfg.get("registration_health_audit_file")
+        or "cpa_auths/registration_health_audit.jsonl"
+    ).strip()
+    path = Path(raw_path).expanduser()
+    if not path.is_absolute():
+        path = (_REG_DIR / path).resolve()
+    record = {
+        "timestamp": int(time.time()),
+        "email": email,
+        "mint_method": result.get("mint_method"),
+        "proxy": result.get("proxy"),
+        "token_metadata": result.get("token_metadata") or {},
+        "classification": health.get("classification"),
+        "confidence": health.get("confidence"),
+        "reject_candidate": bool(health.get("reject_candidate")),
+        "reject_reason": health.get("reject_reason"),
+        "reason": _redact_audit_text(health.get("reason")),
+        "attempts": [
+            _health_attempt_for_audit(dict(item))
+            for item in (health.get("attempts") or [])
+            if isinstance(item, dict)
+        ],
+    }
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with _health_audit_lock:
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+            os.chmod(path, 0o600)
+        log(f"[health] 审计记录已写入: {path}")
+    except Exception as exc:  # noqa: BLE001
+        log(f"[health] 审计记录写入失败: {exc}")
 
 
 def _ensure_cpa_xai_on_path(tools_dir: str | Path | None = None) -> Path:
@@ -79,7 +189,9 @@ def export_cpa_xai_for_account(
     cfg = config or {}
     log = log_callback or (lambda m: print(m, flush=True))
 
-    if not cfg.get("cpa_export_enabled", True):
+    export_enabled = bool(cfg.get("cpa_export_enabled", True))
+    health_enabled = bool(cfg.get("registration_health_check_enabled", False))
+    if not export_enabled and not health_enabled:
         log("[cpa] export disabled")
         return {"ok": False, "skipped": True, "reason": "disabled"}
 
@@ -124,6 +236,12 @@ def export_cpa_xai_for_account(
     prefer_protocol = bool(cfg.get("cpa_prefer_protocol", True))
     protocol_only = bool(cfg.get("cpa_protocol_only", False))
     protocol_poll_timeout = float(cfg.get("cpa_protocol_poll_timeout_sec", 90) or 90)
+    health_probe_delays = _parse_health_delays(
+        cfg.get("registration_health_probe_delays_sec", [0, 15, 45])
+    )
+    health_reject_inconclusive = bool(
+        cfg.get("registration_health_reject_inconclusive", True)
+    )
 
     # cookies: explicit arg > page export > none
     use_cookies = cookies
@@ -190,11 +308,29 @@ def export_cpa_xai_for_account(
         prefer_protocol=prefer_protocol,
         protocol_only=protocol_only,
         protocol_poll_timeout_sec=protocol_poll_timeout,
+        health_check=health_enabled,
+        health_probe_delays=health_probe_delays,
+        health_reject_inconclusive=health_reject_inconclusive,
+        write_auth=export_enabled,
         log=_log,
         cancel=cancel,
     )
     if result.get("mint_method"):
         log(f"[cpa] mint_method={result.get('mint_method')}")
+    _write_health_audit(result=result, email=email, cfg=cfg, log=log)
+
+    if cancel and cancel():
+        for key in ("cpa_path", "path"):
+            raw_path = result.get(key)
+            if raw_path:
+                try:
+                    Path(raw_path).unlink(missing_ok=True)
+                except OSError:
+                    pass
+                result.pop(key, None)
+        result["ok"] = False
+        result["error"] = "cancelled"
+        return result
 
     # By default, a failed post-write probe is only a warning: the CPA auth file
     # has already been minted and written. Set cpa_probe_required=true to make
@@ -223,7 +359,7 @@ def export_cpa_xai_for_account(
             result["cpa_copy_error"] = str(e)
 
     # failure log under register dir
-    if not result.get("ok"):
+    if not result.get("ok") and not result.get("rejected"):
         fail_path = out_dir / "cpa_auth_failed.txt"
         with open(fail_path, "a", encoding="utf-8") as f:
             f.write(f"{email}----{result.get('error') or 'unknown'}----{int(time.time())}\n")

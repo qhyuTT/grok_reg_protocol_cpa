@@ -109,6 +109,9 @@ _stats = {
     "mint_success": 0,
     "mint_fail": 0,
     "mint_skip": 0,
+    "health_rejected": 0,
+    "health_unknown": 0,
+    "activation_failed": 0,
 }
 
 
@@ -123,8 +126,11 @@ _next_idx = [1]
 
 # mint 队列结束哨兵
 _MINT_STOP = object()
+_TASK_STOP = object()
 _REGISTER_STOP = threading.Event()
 _REGISTER_CAPACITY_STOP = threading.Event()
+_SCHEDULER_DONE = threading.Event()
+_accounts_lock = threading.Lock()
 
 
 def resolve_mint_workers(
@@ -152,7 +158,7 @@ def resolve_mint_workers(
     if cfg_v >= 0:
         return max(0, min(cfg_v, 10))
     # auto
-    if config.get("cpa_export_enabled", True):
+    if config.get("cpa_export_enabled", True) or config.get("registration_health_check_enabled", True):
         return max(1, min(int(threads), 4))
     return 0
 
@@ -210,12 +216,8 @@ def register_one(
     worker_id: int,
     idx: int,
     total: int,
-    accounts_file: str,
-    *,
-    do_mint_inline: bool = False,
-    mint_queue: queue.Queue | None = None,
 ) -> dict | None:
-    """Run one registration. Enqueue CPA mint (default) instead of blocking.
+    """Create one candidate account without committing it to any local pool.
 
     Returns dict(email, sso, profile) or None.
     """
@@ -286,12 +288,37 @@ def register_one(
             log_callback=lambda m: log(worker_id, m), cancel_callback=cancel
         )
         password = profile.get("password", "") or ""
-        line = f"{email}----{password}----{sso}\n"
-        with open(accounts_file, "a", encoding="utf-8") as f:
-            f.write(line)
-        log(worker_id, f"+ 注册成功: {email}")
-        reg.mark_used(email, password)
-
+        log(worker_id, "6. 执行 Grok Web 首次激活")
+        activation = reg.activate_grok_web_account(
+            reg._get_page(),
+            log_callback=lambda m: log(worker_id, m),
+            cancel_callback=cancel,
+        )
+        if not activation.get("ok"):
+            reason = str(activation.get("reason") or "web_activation_failed")
+            detail = (
+                f"web_activation:{reason}:"
+                f"session={activation.get('auth_session_status', 0)}:"
+                f"settings={activation.get('user_settings_status', 0)}:"
+                f"dom={activation.get('dom_state', 'unknown')}"
+            )[:240]
+            reg.mark_error(email, password, reason=detail)
+            raise reg.ActivationFailedRegistration(email, detail)
+        try:
+            settle_seconds = max(
+                0.0,
+                float(
+                    (getattr(reg, "config", {}) or {}).get(
+                        "registration_post_activation_settle_sec", 5
+                    )
+                    or 0
+                ),
+            )
+        except Exception:
+            settle_seconds = 5.0
+        if settle_seconds > 0:
+            log(worker_id, f"[activation] 会话完成，等待 {settle_seconds:g}s 后执行 OIDC 健康门")
+            reg.sleep_with_cancel(settle_seconds, cancel)
         # Capture cookies BEFORE releasing browser (for mint cookie inject)
         page = reg._get_page()
         cookies = []
@@ -303,18 +330,6 @@ def register_one(
             cookies = []
         if cookies:
             log(worker_id, f"[*] 导出 cookie {len(cookies)} 条供 mint 注入")
-
-        if page and reg.PERF_FLAGS.get("cookie_snapshot", True):
-            try:
-                reg.save_cookies_snapshot(page, "success", email)
-            except Exception:
-                pass
-        try:
-            reg.add_token_to_grok2api_pools(
-                sso, email=email, log_callback=lambda m: log(worker_id, m)
-            )
-        except Exception as exc:
-            log(worker_id, f"[Debug] grok2api: {exc}")
 
         # Close by default (or clear only when reuse was explicitly enabled)
         # BEFORE mint so registration and CPA browsers do not overlap needlessly.
@@ -333,23 +348,13 @@ def register_one(
             "profile": profile,
             "idx": idx,
             "cookies": cookies,
+            "activation": activation,
         }
 
-        if do_mint_inline:
-            _run_mint_job(f"R{worker_id}", job, getattr(reg, "config", {}) or {})
-        elif mint_queue is not None:
-            # backpressure: wait while queue is saturated
-            qmax = int(getattr(mint_queue, "_reg_qmax", 0) or 0)
-            while qmax > 0 and mint_queue.qsize() >= qmax:
-                log(worker_id, f"[cpa] mint 队列背压 qsize={mint_queue.qsize()}≥{qmax}，等待...")
-                time.sleep(1.0)
-            mint_queue.put(job)
-            log(worker_id, f"[cpa] enqueued mint for {email} (queue≈{mint_queue.qsize()})")
-        else:
-            log(worker_id, "[cpa] mint skipped (no queue / inline)")
-
-        _inc("reg_success")
+        log(worker_id, f"[*] 注册候选已创建，等待权限健康检查: {email}")
         return job
+    except reg.ActivationFailedRegistration:
+        raise
     except Exception as exc:
         log(worker_id, f"! 注册失败: {exc}")
         reg.mark_error(email or "", reason=str(exc)[:120])
@@ -365,7 +370,9 @@ def _run_mint_job(worker_id: int | str, job: dict[str, Any], config: dict) -> di
     if not email or not password:
         _inc("mint_fail")
         return {"ok": False, "error": "missing email/password", "email": email}
-    if not config.get("cpa_export_enabled", True):
+    if not config.get("cpa_export_enabled", True) and not config.get(
+        "registration_health_check_enabled", True
+    ):
         _inc("mint_skip")
         log(worker_id, f"[cpa] export disabled, skip {email}")
         return {"ok": False, "skipped": True, "email": email}
@@ -383,9 +390,18 @@ def _run_mint_job(worker_id: int | str, job: dict[str, Any], config: dict) -> di
             log_callback=lambda m: log(worker_id, m),
             cancel=_REGISTER_STOP.is_set,
         )
-        if result.get("ok"):
+        if result.get("rejected"):
+            log(
+                worker_id,
+                f"! 健康门拒绝: {email}: "
+                f"{result.get('rejection_summary') or result.get('error')}",
+            )
+        elif result.get("ok") and result.get("path"):
             log(worker_id, f"+ CPA auth: {result.get('path')}")
             _inc("mint_success")
+        elif result.get("ok"):
+            _inc("mint_skip")
+            log(worker_id, f"[cpa] health-only 完成，未写 CPA 文件: {email}")
         elif result.get("skipped"):
             _inc("mint_skip")
             log(worker_id, f"[cpa] skipped: {result.get('reason')}")
@@ -400,6 +416,94 @@ def _run_mint_job(worker_id: int | str, job: dict[str, Any], config: dict) -> di
         return {"ok": False, "error": str(exc), "email": email}
 
 
+def _finalize_candidate(
+    worker_id: int | str,
+    job: dict[str, Any],
+    mint_result: dict[str, Any],
+    accounts_file: str,
+) -> str:
+    """Commit a candidate only after the health gate has made its decision."""
+    email = str(job.get("email") or "")
+    password = str(job.get("password") or "")
+    sso = str(job.get("sso") or "")
+    if mint_result.get("rejected"):
+        _inc("health_rejected")
+        rejection_summary = str(
+            mint_result.get("rejection_summary")
+            or mint_result.get("error")
+            or "health_gate_rejected"
+        )[:240]
+        try:
+            reg.mark_error(email, password, reason=rejection_summary)
+        except Exception:
+            pass
+        log(worker_id, f"[-] 健康门淘汰候选且不落盘: {email} ({rejection_summary})")
+        return "rejected"
+
+    health = mint_result.get("health") if isinstance(mint_result, dict) else None
+    classification = health.get("classification") if isinstance(health, dict) else "unknown"
+    if classification != "healthy":
+        _inc("health_unknown")
+        log(worker_id, f"[health] 非明确权限拒绝，按配置保留: {email} ({classification})")
+
+    line = f"{email}----{password}----{sso}\n"
+    with _accounts_lock:
+        with open(accounts_file, "a", encoding="utf-8") as f:
+            f.write(line)
+    try:
+        reg.mark_used(email, password)
+    except Exception:
+        pass
+    if job.get("cookies") and reg.PERF_FLAGS.get("cookie_snapshot", True):
+        try:
+            reg.save_exported_cookies_snapshot(job["cookies"], "success", email)
+        except Exception:
+            pass
+    try:
+        reg.add_token_to_grok2api_pools(
+            sso, email=email, log_callback=lambda m: log(worker_id, m)
+        )
+    except Exception as exc:
+        log(worker_id, f"[Debug] grok2api: {exc}")
+    _inc("reg_success")
+    if classification == "healthy":
+        log(worker_id, f"[+] 注册成功并通过健康门: {email}")
+    else:
+        log(worker_id, f"[+] 注册成功，健康结果按策略保留: {email} ({classification})")
+    return "accepted"
+
+
+def _emit_outcome(outcome_queue: queue.Queue | None, job: dict[str, Any], status: str) -> None:
+    if outcome_queue is None:
+        return
+    outcome_queue.put(
+        {
+            "slot": job.get("slot"),
+            "replacement": int(job.get("replacement", 0) or 0),
+            "status": status,
+            "idx": job.get("idx"),
+        }
+    )
+
+
+def _safe_finalize_candidate(
+    worker_id: int | str,
+    job: dict[str, Any],
+    mint_result: dict[str, Any],
+    accounts_file: str,
+) -> str:
+    try:
+        return _finalize_candidate(worker_id, job, mint_result, accounts_file)
+    except Exception as exc:
+        _inc("reg_fail")
+        log(worker_id, f"! 候选提交失败: {exc}")
+        try:
+            reg.mark_error(str(job.get("email") or ""), reason=str(exc)[:120])
+        except Exception:
+            pass
+        return "failed"
+
+
 def _register_worker(
     worker_id: int,
     task_queue: queue.Queue,
@@ -408,23 +512,38 @@ def _register_worker(
     mint_queue: queue.Queue | None,
     forever: bool,
     do_mint_inline: bool,
+    outcome_queue: queue.Queue | None = None,
 ):
     while not _REGISTER_STOP.is_set() and not _REGISTER_CAPACITY_STOP.is_set():
         try:
-            idx = task_queue.get_nowait()
+            task = task_queue.get(timeout=0.5)
         except queue.Empty:
             if not forever:
-                break
+                if _SCHEDULER_DONE.is_set():
+                    break
+                continue
             if _REGISTER_STOP.is_set():
                 break
             with _next_idx_lock:
                 nxt = _next_idx[0]
                 _next_idx[0] = nxt + 5
             for i in range(nxt, nxt + 5):
-                task_queue.put(i)
+                task_queue.put({"idx": i, "slot": None, "replacement": 0})
             continue
 
+        if task is _TASK_STOP:
+            task_queue.task_done()
+            break
+        if isinstance(task, int):
+            task = {"idx": task, "slot": task, "replacement": 0}
+        elif not isinstance(task, dict):
+            task_queue.task_done()
+            continue
+        idx = int(task.get("idx") or 0)
+
         retry = 0
+        candidate = None
+        activation_failure = None
         while retry < 2 and not _REGISTER_STOP.is_set() and not _REGISTER_CAPACITY_STOP.is_set():
             result = None
             try:
@@ -432,17 +551,20 @@ def _register_worker(
                     worker_id,
                     idx,
                     total,
-                    accounts_file,
-                    do_mint_inline=do_mint_inline,
-                    mint_queue=mint_queue,
                 )
                 if result:
+                    candidate = result
                     break
                 if _REGISTER_CAPACITY_STOP.is_set():
                     break
                 retry += 1
                 if retry < 2 and not _REGISTER_STOP.is_set():
                     log(worker_id, f"[retry] 账号 {idx} 失败，重试 {retry}/1")
+            except reg.ActivationFailedRegistration as exc:
+                activation_failure = exc
+                _inc("activation_failed")
+                log(worker_id, f"[-] Web 激活失败，候选淘汰: {exc.reason}")
+                break
             except Exception:
                 retry += 1
                 if retry < 2 and not _REGISTER_STOP.is_set():
@@ -457,9 +579,36 @@ def _register_worker(
                     except Exception:
                         pass
 
-        if retry >= 2:
-            # register_one already counted fail on exception path; if both returned None, count once more only if needed
-            pass
+        if candidate:
+            candidate.update(task)
+            if do_mint_inline:
+                mint_result = _run_mint_job(f"R{worker_id}", candidate, getattr(reg, "config", {}) or {})
+                if _REGISTER_STOP.is_set():
+                    status = "failed"
+                else:
+                    status = _safe_finalize_candidate(
+                        f"R{worker_id}", candidate, mint_result, accounts_file
+                    )
+                _emit_outcome(outcome_queue, candidate, status)
+            elif mint_queue is not None:
+                qmax = int(getattr(mint_queue, "_reg_qmax", 0) or 0)
+                while qmax > 0 and mint_queue.qsize() >= qmax and not _REGISTER_STOP.is_set():
+                    log(worker_id, f"[cpa] mint 队列背压 qsize={mint_queue.qsize()}≥{qmax}，等待...")
+                    time.sleep(1.0)
+                candidate["accounts_file"] = accounts_file
+                candidate["outcome_queue"] = outcome_queue
+                mint_queue.put(candidate)
+                log(worker_id, f"[cpa] enqueued health+mint for {candidate.get('email')} (queue≈{mint_queue.qsize()})")
+            else:
+                status = _safe_finalize_candidate(
+                    worker_id, candidate, {"ok": False, "skipped": True}, accounts_file
+                )
+                _emit_outcome(outcome_queue, candidate, status)
+        elif activation_failure is not None:
+            _emit_outcome(outcome_queue, task, "activation_failed")
+        else:
+            _emit_outcome(outcome_queue, task, "failed")
+        task_queue.task_done()
 
     # worker exit: free browser
     try:
@@ -477,7 +626,17 @@ def _mint_worker(worker_id: str, mint_queue: queue.Queue, config: dict):
                 break
             if not isinstance(job, dict):
                 continue
-            _run_mint_job(worker_id, job, config)
+            result = _run_mint_job(worker_id, job, config)
+            if _REGISTER_STOP.is_set():
+                status = "failed"
+            else:
+                status = _safe_finalize_candidate(
+                    worker_id,
+                    job,
+                    result,
+                    str(job.get("accounts_file") or "accounts_cli.txt"),
+                )
+            _emit_outcome(job.get("outcome_queue"), job, status)
         finally:
             mint_queue.task_done()
     try:
@@ -535,6 +694,10 @@ def main() -> int:
     args = build_parser().parse_args()
     _REGISTER_STOP.clear()
     _REGISTER_CAPACITY_STOP.clear()
+    _SCHEDULER_DONE.clear()
+    with _stats_lock:
+        for key in list(_stats):
+            _stats[key] = 0
 
     reg.load_config()
     cfg0 = getattr(reg, "config", {}) or {}
@@ -635,17 +798,18 @@ def main() -> int:
         return 1
 
     task_queue: queue.Queue = queue.Queue()
+    outcome_queue: queue.Queue | None = queue.Queue() if remaining is not None else None
     mint_queue: queue.Queue | None = queue.Queue() if not do_mint_inline else None
     if mint_queue is not None:
         mint_queue._reg_qmax = mint_qmax  # type: ignore[attr-defined]
     global _next_idx
-    _next_idx[0] = done_count + 1
     if remaining is not None:
-        for i in range(done_count + 1, args.count + 1):
-            task_queue.put(i)
+        for slot, i in enumerate(range(done_count + 1, args.count + 1), 1):
+            task_queue.put({"idx": i, "slot": slot, "replacement": 0})
+        _next_idx[0] = args.count + 1
     else:
         for i in range(done_count + 1, done_count + threads * 5 + 1):
-            task_queue.put(i)
+            task_queue.put({"idx": i, "slot": None, "replacement": 0})
         _next_idx[0] = done_count + threads * 5 + 1
 
     forever = remaining is None
@@ -669,7 +833,16 @@ def main() -> int:
     for wid in range(1, threads + 1):
         t = threading.Thread(
             target=_register_worker,
-            args=(wid, task_queue, args.count, args.accounts_file, mint_queue, forever, do_mint_inline),
+            args=(
+                wid,
+                task_queue,
+                args.count,
+                args.accounts_file,
+                mint_queue,
+                forever,
+                do_mint_inline,
+                outcome_queue,
+            ),
             daemon=True,
             name=f"reg-{wid}",
         )
@@ -677,11 +850,53 @@ def main() -> int:
         reg_threads.append(t)
 
     try:
+        if remaining is not None and outcome_queue is not None:
+            completed_slots = 0
+            raw_limit = cfg.get("registration_health_max_replacements_per_slot", 3)
+            max_replacements = max(0, int(3 if raw_limit is None else raw_limit))
+            while completed_slots < remaining and not _REGISTER_STOP.is_set():
+                if _REGISTER_CAPACITY_STOP.is_set():
+                    log(0, "[health] 邮箱容量耗尽，停止补号并保留已完成结果")
+                    break
+                try:
+                    outcome = outcome_queue.get(timeout=0.5)
+                except queue.Empty:
+                    continue
+                status = str(outcome.get("status") or "failed")
+                replacement = int(outcome.get("replacement", 0) or 0)
+                slot = outcome.get("slot")
+                if status in {"rejected", "activation_failed"} and replacement < max_replacements:
+                    with _next_idx_lock:
+                        idx = _next_idx[0]
+                        _next_idx[0] += 1
+                    task_queue.put(
+                        {"idx": idx, "slot": slot, "replacement": replacement + 1}
+                    )
+                    log(
+                        0,
+                        f"[health] 槽位 {slot} 候选淘汰({status})，补注册 "
+                        f"{replacement + 1}/{max_replacements}",
+                    )
+                else:
+                    if status in {"rejected", "activation_failed"}:
+                        _inc("reg_fail")
+                        log(0, f"[health] 槽位 {slot} 已达到最大补号次数")
+                    completed_slots += 1
+            _SCHEDULER_DONE.set()
+            while True:
+                try:
+                    task_queue.get_nowait()
+                    task_queue.task_done()
+                except queue.Empty:
+                    break
+            for _ in reg_threads:
+                task_queue.put(_TASK_STOP)
         for t in reg_threads:
             t.join()
     except KeyboardInterrupt:
         print("\n[!] 用户中断", flush=True)
         _REGISTER_STOP.set()
+        _SCHEDULER_DONE.set()
         try:
             reg.shutdown_browser(block_new=True)
         except Exception:
@@ -719,7 +934,9 @@ def main() -> int:
     print(
         f"=== 完成: 注册成功 {s.get('reg_success', 0)}, 注册失败 {s.get('reg_fail', 0)}, "
         f"CPA成功 {s.get('mint_success', 0)}, CPA失败 {s.get('mint_fail', 0)}, "
-        f"CPA跳过 {s.get('mint_skip', 0)} ===",
+        f"CPA跳过 {s.get('mint_skip', 0)}, 权限拒绝 {s.get('health_rejected', 0)}, "
+        f"Web激活失败 {s.get('activation_failed', 0)}, "
+        f"探测非健康但保留 {s.get('health_unknown', 0)} ===",
         flush=True,
     )
     return 0 if s.get("reg_success", 0) > 0 else 1

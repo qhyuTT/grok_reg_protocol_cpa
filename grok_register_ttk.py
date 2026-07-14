@@ -21,6 +21,7 @@ import string
 import json
 
 from DrissionPage import Chromium, ChromiumOptions
+from DrissionPage.common import Keys
 from DrissionPage.errors import PageDisconnectedError
 from curl_cffi import requests
 from custom_mail import CustomMailCapacityExhausted, CustomMailPool
@@ -54,6 +55,12 @@ DEFAULT_CONFIG = {
     "cloudmail_admin_email": "",
     "cloudmail_password": "",
     "cpa_gui_close_mint_browser": True,
+    "registration_health_check_enabled": True,
+    "registration_health_max_replacements_per_slot": 3,
+    "registration_health_probe_delays_sec": [0, 15, 45],
+    "registration_health_reject_inconclusive": True,
+    "registration_health_audit_file": "cpa_auths/registration_health_audit.jsonl",
+    "registration_post_activation_settle_sec": 5,
     "hotmail_accounts_file": "mail_credentials.txt",
     "hotmail_alias_mode": "random",
     "hotmail_alias_random_length": 8,
@@ -253,6 +260,29 @@ def check_timeout(start_time: float):
 _COOKIE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies", "grok")
 
 
+def save_exported_cookies_snapshot(cookies, tag: str = "", email: str = "", url: str = ""):
+    """保存已经导出的 cookie；用于健康检查通过后再持久化快照。"""
+    if not PERF_FLAGS.get("cookie_snapshot", True):
+        return
+    try:
+        os.makedirs(_COOKIE_DIR, exist_ok=True)
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        cookies = list(cookies or [])
+        data = {
+            "ts": ts,
+            "tag": tag,
+            "email": email,
+            "url": url,
+            "cookies": cookies,
+        }
+        path = os.path.join(_COOKIE_DIR, f"full_{ts}_{tag}.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        print(f"  [cookies] saved: {path} ({len(cookies)} cookies)")
+    except Exception as e:
+        print(f"  [cookies] save err: {e}")
+
+
 def save_cookies_snapshot(page, tag: str = "", email: str = ""):
     """保存当前浏览器上下文的全量 cookie 快照。"""
     if not PERF_FLAGS.get("cookie_snapshot", True):
@@ -261,20 +291,12 @@ def save_cookies_snapshot(page, tag: str = "", email: str = ""):
         browser = _get_browser()
         if not browser:
             return
-        os.makedirs(_COOKIE_DIR, exist_ok=True)
-        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        cookies = browser.cookies()
-        data = {
-            "ts": ts,
-            "tag": tag,
-            "email": email,
-            "url": page.url if page else "",
-            "cookies": cookies,
-        }
-        path = os.path.join(_COOKIE_DIR, f"full_{ts}_{tag}.json")
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
-        print(f"  [cookies] saved: {path} ({len(cookies)} cookies)")
+        save_exported_cookies_snapshot(
+            browser.cookies(),
+            tag=tag,
+            email=email,
+            url=page.url if page else "",
+        )
     except Exception as e:
         print(f"  [cookies] save err: {e}")
 
@@ -306,6 +328,23 @@ def load_env():
 
 class RegistrationCancelled(Exception):
     pass
+
+
+class PermissionDeniedRegistration(Exception):
+    """A fully registered candidate whose chat permission was explicitly denied."""
+
+    def __init__(self, email: str):
+        super().__init__(f"permission_denied: {email}")
+        self.email = email
+
+
+class ActivationFailedRegistration(Exception):
+    """A registered candidate that failed the required Grok Web activation."""
+
+    def __init__(self, email: str, reason: str = "web_activation_failed"):
+        super().__init__(f"web_activation_failed: {email}: {reason}")
+        self.email = email
+        self.reason = reason
 
 
 def load_config():
@@ -3174,6 +3213,452 @@ def enable_nsfw(sso_cookie, log_callback=None):
     return results
 
 
+# ── 注册后 Grok Web 激活 ──
+
+GROK_ACTIVATION_MESSAGES = (
+    "你好",
+    "Hello",
+    "Hi there",
+    "简单介绍一下你自己",
+    "Tell me something interesting",
+    "Give me a short greeting",
+)
+GROK_CHAT_INPUT_SELECTORS = (
+    '[role="textbox"][aria-label="Ask Grok anything"]',
+    'textarea[aria-label="向 Grok 提任何问题"]',
+    '[data-testid="chat-input"]',
+)
+GROK_BIRTH_INPUT_SELECTORS = (
+    'input[aria-label="出生年份"]',
+    'input[aria-label="Birth year"]',
+    '[role="dialog"] input[inputmode="numeric"]',
+    '[role="dialog"] input[type="number"]',
+)
+GROK_BIRTH_BUTTON_WORDS = (
+    "保存",
+    "继续",
+    "确认",
+    "完成",
+    "save",
+    "continue",
+    "confirm",
+    "done",
+)
+
+
+def _activation_find_element(page, selectors, timeout=0.15):
+    """Return the first visible/enabled element matching the selector list."""
+    for selector in selectors:
+        try:
+            element = page.ele(f"css:{selector}", timeout=timeout)
+            if not element:
+                continue
+            states = getattr(element, "states", None)
+            if states is not None:
+                if not states.is_displayed:
+                    continue
+                if hasattr(states, "is_enabled") and not states.is_enabled:
+                    continue
+            return element, selector
+        except Exception:
+            continue
+    return None, None
+
+
+def _activation_conversation_url(page):
+    try:
+        url = str(page.url or "")
+    except Exception:
+        return ""
+    if re.search(r"https?://(?:www\.)?grok\.com/c/[^/?#]+", url):
+        return url
+    return ""
+
+
+def _activation_pick_birth_button(page):
+    """Find a human-facing save/continue button inside the birthday dialog."""
+    try:
+        buttons = page.eles('css:[role="dialog"] button', timeout=0.15)
+    except Exception:
+        buttons = []
+    visible = []
+    for button in buttons or []:
+        try:
+            states = button.states
+            if not states.is_displayed or not states.is_enabled:
+                continue
+            visible.append(button)
+            text = re.sub(r"\s+", "", str(button.text or "")).lower()
+            if any(word in text for word in GROK_BIRTH_BUTTON_WORDS):
+                return button
+        except Exception:
+            continue
+    return visible[-1] if visible else None
+
+
+def _activation_packet_status(packet):
+    try:
+        response = getattr(packet, "response", None)
+        return int(getattr(response, "status", 0) or 0)
+    except Exception:
+        return 0
+
+
+def _activation_packet_url(packet):
+    try:
+        return str(getattr(packet, "url", "") or "")
+    except Exception:
+        return ""
+
+
+def _activation_url_is_grok(url):
+    return bool(re.search(r"https?://(?:www\.)?grok\.com(?:/|$)", str(url or "")))
+
+
+def _activation_auth_state(page):
+    """Return authenticated/anonymous/unknown from the visible Grok shell."""
+    try:
+        state = page.run_js(
+            r"""
+const visible = (node) => {
+  if (!node) return false;
+  const s = getComputedStyle(node);
+  const r = node.getBoundingClientRect();
+  return s.display !== 'none' && s.visibility !== 'hidden' &&
+    s.opacity !== '0' && r.width > 0 && r.height > 0;
+};
+const authWords = /(登录|注册|登录帐号|log\s*in|sign\s*in|sign\s*up|register)/i;
+const anonymous = [...document.querySelectorAll('a,button')]
+  .filter(visible)
+  .map((n) => (n.innerText || n.textContent || '').replace(/\s+/g, ' ').trim())
+  .some((t) => authWords.test(t));
+const userMarker = !!document.querySelector(
+  '[data-testid="new-chat"], [data-testid*="user"], [data-testid*="profile"], '
+  + '[aria-label*="账户"], [aria-label*="account"]'
+);
+if (anonymous) return 'anonymous';
+if (userMarker) return 'authenticated';
+return 'unknown';
+"""
+        )
+        return str(state or "unknown")
+    except Exception:
+        return "unknown"
+
+
+def _activation_session_probe(page):
+    """Actively verify the already-loaded Grok session without exposing data."""
+    try:
+        result = page.run_js(
+            r"""
+return Promise.all([
+  fetch('/api/auth/session', {credentials: 'include', cache: 'no-store'}),
+  fetch('/rest/user-settings', {credentials: 'include', cache: 'no-store'})
+]).then(async ([sessionResponse, settingsResponse]) => {
+  let sessionData = null;
+  try { sessionData = await sessionResponse.json(); } catch (_) {}
+  const nonEmpty = !!sessionData && typeof sessionData === 'object'
+    && Object.keys(sessionData).length > 0;
+  const identity = !!(sessionData && (
+    sessionData.user || sessionData.email || sessionData.id ||
+    sessionData.sub || sessionData.account || sessionData.expires
+  ));
+  return {
+    auth_session_status: sessionResponse.status,
+    user_settings_status: settingsResponse.status,
+    session_nonempty: nonEmpty,
+    session_identity: identity,
+  };
+}).catch((error) => ({
+  auth_session_status: 0,
+  user_settings_status: 0,
+  session_nonempty: false,
+  session_identity: false,
+  request_error: String(error && error.message || error || 'fetch failed').slice(0, 200),
+}));
+""",
+            timeout=15,
+        )
+        return dict(result) if isinstance(result, dict) else {
+            "auth_session_status": 0,
+            "user_settings_status": 0,
+            "session_nonempty": False,
+            "session_identity": False,
+            "request_error": "invalid session probe result",
+        }
+    except Exception as exc:
+        return {
+            "auth_session_status": 0,
+            "user_settings_status": 0,
+            "session_nonempty": False,
+            "session_identity": False,
+            "request_error": str(exc)[:200],
+        }
+
+
+def wait_for_authenticated_grok_page(page, log_callback=None, cancel_callback=None, timeout=60):
+    """Wait for Grok's natural post-registration session hydration.
+
+    A chat box alone is not sufficient because the anonymous shell also
+    exposes one.  The current Grok app consistently requests both the session
+    and user-settings endpoints after the registered account is attached.
+    """
+    if page is None:
+        return {"ok": False, "reason": "registration_page_unavailable"}
+    if not _activation_url_is_grok(getattr(page, "url", "")):
+        return {"ok": False, "reason": "grok_natural_redirect_missing"}
+
+    deadline = time.time() + max(5, float(timeout))
+    last_probe = {
+        "auth_session_status": 0,
+        "user_settings_status": 0,
+        "session_nonempty": False,
+        "session_identity": False,
+        "request_error": "",
+    }
+    next_probe_at = 0.0
+    try:
+        while time.time() < deadline:
+            raise_if_cancelled(cancel_callback)
+            now = time.time()
+            if now >= next_probe_at:
+                last_probe = _activation_session_probe(page)
+                next_probe_at = now + 2.0
+
+            auth_state = _activation_auth_state(page)
+            endpoints_ready = (
+                200 <= int(last_probe.get("auth_session_status") or 0) < 300
+                and 200 <= int(last_probe.get("user_settings_status") or 0) < 300
+                and bool(last_probe.get("session_nonempty"))
+            )
+            if endpoints_ready and auth_state != "anonymous":
+                if log_callback:
+                    log_callback(
+                        "[activation] Grok 登录态确认完成 "
+                        f"auth_session={last_probe.get('auth_session_status')} "
+                        f"user_settings={last_probe.get('user_settings_status')}"
+                    )
+                return {
+                    "ok": True,
+                    "status": "authenticated",
+                    **last_probe,
+                    "ready_url": str(getattr(page, "url", "") or ""),
+                    "dom_state": auth_state,
+                }
+            sleep_with_cancel(0.15, cancel_callback)
+
+        auth_state = _activation_auth_state(page)
+        reason = (
+            "grok_session_not_authenticated"
+            if auth_state == "anonymous"
+            else "grok_session_probe_timeout"
+        )
+        return {
+            "ok": False,
+            "reason": reason,
+            **last_probe,
+            "dom_state": auth_state,
+        }
+    except RegistrationCancelled:
+        raise
+    except Exception as exc:
+        return {"ok": False, "reason": f"grok_auth_wait_exception: {exc}"}
+
+
+def activate_grok_web_account(page, log_callback=None, cancel_callback=None, timeout=120):
+    """Complete the same first-use flow a human performs on grok.com.
+
+    The registration browser must remain alive while this function runs.  It
+    sends one harmless message through trusted browser input, handles the
+    birthday dialog if shown, and only succeeds after the conversation is
+    created.  Expected failures are returned as ``{"ok": False, ...}`` so the
+    caller can discard the candidate before exporting cookies or minting CPA.
+    """
+    def log(message):
+        if log_callback:
+            log_callback(message)
+
+    if page is None:
+        return {"ok": False, "reason": "registration_page_unavailable"}
+
+    deadline = time.time() + max(5, float(timeout))
+    listener = getattr(page, "listen", None)
+    listener_started = False
+    birth_saved = False
+    birth_status = None
+    birth_year = None
+    message = secrets.choice(GROK_ACTIVATION_MESSAGES)
+
+    try:
+        raise_if_cancelled(cancel_callback)
+        if not _activation_url_is_grok(getattr(page, "url", "")):
+            return {"ok": False, "reason": "grok_natural_redirect_missing"}
+
+        auth_result = wait_for_authenticated_grok_page(
+            page,
+            log_callback=log_callback,
+            cancel_callback=cancel_callback,
+            timeout=min(60, max(5, deadline - time.time())),
+        )
+        if not auth_result.get("ok"):
+            return auth_result
+
+        if listener is None:
+            return {"ok": False, "reason": "network_listener_unavailable"}
+        try:
+            listener.start(
+                targets=(
+                    "/rest/auth/set-birth-date",
+                    "/rest/app-chat/conversations/new",
+                ),
+                method="POST",
+            )
+            listener_started = True
+        except Exception as exc:
+            return {"ok": False, "reason": f"network_listener_start_failed: {exc}"}
+
+        chat_element = None
+        chat_selector = None
+        while time.time() < deadline:
+            raise_if_cancelled(cancel_callback)
+            chat_element, chat_selector = _activation_find_element(page, GROK_CHAT_INPUT_SELECTORS)
+            if chat_element is not None:
+                break
+            sleep_with_cancel(0.25, cancel_callback)
+        if chat_element is None:
+            return {"ok": False, "reason": "chat_input_timeout"}
+
+        try:
+            chat_element.click()
+            chat_element.input(message, clear=True)
+            page.actions.type(Keys.ENTER)
+        except Exception as exc:
+            return {"ok": False, "reason": f"chat_submit_failed: {exc}"}
+        log(f"[activation] 首条消息已提交 selector={chat_selector}")
+
+        # Enter either opens the birthday modal or immediately creates a
+        # conversation for accounts that already have a birth date.
+        birth_element = None
+        conversation_status = None
+        while time.time() < deadline:
+            raise_if_cancelled(cancel_callback)
+            packet = listener.wait(timeout=0.1, raise_err=False)
+            if packet:
+                packet_url = _activation_packet_url(packet)
+                packet_status = _activation_packet_status(packet)
+                if "/rest/app-chat/conversations/new" in packet_url:
+                    conversation_status = packet_status
+                    if not 200 <= conversation_status < 300:
+                        return {
+                            "ok": False,
+                            "reason": f"conversation_create_http_{conversation_status}",
+                        }
+            conversation_url = _activation_conversation_url(page)
+            if conversation_url or (
+                isinstance(conversation_status, int) and 200 <= conversation_status < 300
+            ):
+                log("[activation] 账号已有生日，首条消息已进入会话")
+                return {
+                    "ok": True,
+                    "status": "activated",
+                    "message": message,
+                    "birth_date_saved": False,
+                    "conversation_url": conversation_url,
+                    "conversation_status": conversation_status,
+                    "auth": auth_result,
+                }
+            birth_element, _birth_selector = _activation_find_element(
+                page, GROK_BIRTH_INPUT_SELECTORS
+            )
+            if birth_element is not None:
+                break
+            sleep_with_cancel(0.25, cancel_callback)
+        if birth_element is None:
+            return {"ok": False, "reason": "birthday_dialog_timeout"}
+
+        birth_year = datetime.datetime.now().year - secrets.randbelow(21) - 20
+        try:
+            birth_element.click()
+            birth_element.input(str(birth_year), clear=True)
+        except Exception as exc:
+            return {"ok": False, "reason": f"birth_year_input_failed: {exc}"}
+
+        clicks = 0
+        last_click_at = 0.0
+        while time.time() < deadline:
+            raise_if_cancelled(cancel_callback)
+            # Drain the targeted response without blocking the DOM polling.
+            if listener_started:
+                packet = listener.wait(timeout=0.1, raise_err=False)
+                if packet:
+                    packet_url = _activation_packet_url(packet)
+                    packet_status = _activation_packet_status(packet)
+                    if "/rest/auth/set-birth-date" in packet_url:
+                        birth_status = packet_status
+                        if not 200 <= birth_status < 300:
+                            return {
+                                "ok": False,
+                                "reason": f"set_birth_date_http_{birth_status}",
+                                "birth_status": birth_status,
+                            }
+                        birth_saved = True
+                        log(f"[activation] 生日保存成功 HTTP {birth_status}")
+                    elif "/rest/app-chat/conversations/new" in packet_url:
+                        conversation_status = packet_status
+                        if not 200 <= conversation_status < 300:
+                            return {
+                                "ok": False,
+                                "reason": f"conversation_create_http_{conversation_status}",
+                            }
+                        log(f"[activation] 会话创建接口成功 HTTP {conversation_status}")
+
+            conversation_url = _activation_conversation_url(page)
+            conversation_created = conversation_url or (
+                isinstance(conversation_status, int) and 200 <= conversation_status < 300
+            )
+            if birth_saved and conversation_created:
+                conversation_url = _activation_conversation_url(page)
+                log(f"[activation] 会话创建成功 {conversation_url}")
+                return {
+                    "ok": True,
+                    "status": "activated",
+                    "message": message,
+                    "birth_year": birth_year,
+                    "birth_date_saved": True,
+                    "birth_status": birth_status,
+                    "conversation_url": conversation_url,
+                    "conversation_status": conversation_status,
+                    "auth": auth_result,
+                }
+
+            now = time.time()
+            if clicks < 2 and (clicks == 0 or now - last_click_at >= 0.8):
+                button = _activation_pick_birth_button(page)
+                if button is not None:
+                    try:
+                        button.click()
+                        clicks += 1
+                        last_click_at = now
+                        log(f"[activation] 已点击生日保存按钮 ({clicks}/2)")
+                    except Exception as exc:
+                        return {"ok": False, "reason": f"birth_save_click_failed: {exc}"}
+            sleep_with_cancel(0.15, cancel_callback)
+
+        if birth_status is None:
+            return {"ok": False, "reason": "set_birth_date_timeout"}
+        return {"ok": False, "reason": "conversation_creation_timeout", "birth_status": birth_status}
+    except RegistrationCancelled:
+        raise
+    except Exception as exc:
+        return {"ok": False, "reason": f"web_activation_exception: {exc}"}
+    finally:
+        if listener_started:
+            try:
+                listener.stop()
+            except Exception:
+                pass
+
+
 # ── wait_for_sso_cookie ──
 
 
@@ -3182,6 +3667,10 @@ def wait_for_sso_cookie(timeout=120, log_callback=None, cancel_callback=None):
     last_seen_names = set()
     last_submit_retry = 0.0
     last_cf_retry_at = 0.0
+    sso_value = ""
+    sso_domain = ""
+    logged_sso = False
+    last_url = ""
 
     while time.time() < deadline:
         raise_if_cancelled(cancel_callback)
@@ -3190,6 +3679,10 @@ def wait_for_sso_cookie(timeout=120, log_callback=None, cancel_callback=None):
             if page is None:
                 human_sleep(1, cancel_callback)
                 continue
+            try:
+                last_url = str(page.url or "")
+            except Exception:
+                last_url = ""
 
             # 仍停留在“完成注册”页时，若 Cloudflare 已通过，周期性重试点击提交
             now = time.time()
@@ -3269,17 +3762,30 @@ return String(cfInput.value || '').trim().length;
                 if isinstance(item, dict):
                     name = str(item.get("name", "")).strip()
                     value = str(item.get("value", "")).strip()
+                    domain = str(item.get("domain", "")).strip()
                 else:
                     name = str(getattr(item, "name", "")).strip()
                     value = str(getattr(item, "value", "")).strip()
+                    domain = str(getattr(item, "domain", "")).strip()
 
                 if name:
                     last_seen_names.add(name)
 
                 if name == "sso" and value:
+                    sso_value = value
+                    sso_domain = domain
+
+            if sso_value:
+                if not logged_sso and log_callback:
+                    log_callback(
+                        "[*] 已获取到 sso cookie，等待注册页自然跳转到 Grok"
+                        + (f" domain={sso_domain}" if sso_domain else "")
+                    )
+                    logged_sso = True
+                if _activation_url_is_grok(last_url):
                     if log_callback:
-                        log_callback("[*] 已获取到 sso cookie")
-                    return value
+                        log_callback(f"[*] 注册页已自然进入 Grok: {last_url}")
+                    return sso_value
         except PageDisconnectedError:
             refresh_active_page()
         except Exception:
@@ -3288,7 +3794,8 @@ return String(cfInput.value || '').trim().length;
         human_sleep(1, cancel_callback)
 
     raise Exception(
-        f"等待超时：未获取到 sso cookie。已看到 cookies: {sorted(last_seen_names)}"
+        "等待超时：未完成 sso + Grok 自然跳转。"
+        f"已看到 cookies: {sorted(last_seen_names)}，最后URL: {last_url}"
     )
 
 
@@ -3508,7 +4015,9 @@ def export_cpa_after_success(
 ):
     """GUI 成功注册后的 CPA xai-*.json 导出 hook。"""
     log = log_callback or (lambda m: print(m, flush=True))
-    if not config.get("cpa_export_enabled", True):
+    if not config.get("cpa_export_enabled", True) and not config.get(
+        "registration_health_check_enabled", True
+    ):
         log("[cpa] export disabled, skip")
         return {"ok": False, "skipped": True, "reason": "disabled"}
     if not email or not password:
@@ -3554,8 +4063,15 @@ def export_cpa_after_success(
                 raise
             return {"ok": False, "error": str(exc)}
 
-    if result.get("ok"):
+    if result.get("ok") and result.get("path"):
         log(f"[cpa] CPA 格式已导出: {result.get('path')}")
+    elif result.get("ok"):
+        log("[cpa] 权限健康检查完成；CPA 文件导出已关闭")
+    elif result.get("rejected"):
+        log(
+            "[cpa] 健康门拒绝: "
+            f"{result.get('rejection_summary') or result.get('error') or result}"
+        )
     else:
         log(f"[cpa] CPA 导出失败: {result.get('error') or result}")
     return result
@@ -3571,6 +4087,8 @@ class GrokRegisterGUI:
         self.batch_count = 0
         self.success_count = 0
         self.fail_count = 0
+        self.health_rejected_count = 0
+        self.activation_failed_count = 0
         self.results = []
         self.stop_requested = False
         self.ui_queue = queue.Queue()
@@ -3805,7 +4323,7 @@ class GrokRegisterGUI:
         ttk.Label(status_frame, text="状态: ").pack(side=tk.LEFT)
         self.status_label = ttk.Label(status_frame, textvariable=self.status_var, foreground="green")
         self.status_label.pack(side=tk.LEFT)
-        self.stats_var = tk.StringVar(value="成功: 0 | 失败: 0")
+        self.stats_var = tk.StringVar(value="成功: 0 | 失败: 0 | 权限拒绝: 0")
         ttk.Label(status_frame, textvariable=self.stats_var).pack(side=tk.RIGHT)
         log_frame = ttk.LabelFrame(main_frame, text="日志", padding=5)
         log_frame.pack(fill=tk.BOTH, expand=True, pady=5)
@@ -3858,7 +4376,10 @@ class GrokRegisterGUI:
         return len(valid_domains), len(valid_gmail_accounts)
 
     def update_stats(self):
-        self.stats_var.set(f"成功: {self.success_count} | 失败: {self.fail_count}")
+        self.stats_var.set(
+            f"成功: {self.success_count} | 失败: {self.fail_count} | "
+            f"权限拒绝: {self.health_rejected_count} | Web激活失败: {self.activation_failed_count}"
+        )
 
     def _set_running_ui(self, running):
         self.is_running = running
@@ -4145,6 +4666,8 @@ class GrokRegisterGUI:
         self.mail_capacity_exhausted = False
         self.success_count = 0
         self.fail_count = 0
+        self.health_rejected_count = 0
+        self.activation_failed_count = 0
         self.results = []
         now = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         self.accounts_output_file = os.path.join(
@@ -4241,22 +4764,39 @@ class GrokRegisterGUI:
                     pass
             raise
         password = profile.get("password", "") or ""
-        result_record = {"email": email, "sso": sso, "profile": profile}
-        with self.stats_lock:
-            self.results.append(result_record)
-            self.success_count += 1
-            line = f"{email}----{password}----{sso}\n"
+        logf("[*] 6. 执行 Grok Web 首次激活")
+        activation = activate_grok_web_account(
+            _get_page(),
+            log_callback=logf,
+            cancel_callback=self.should_stop,
+        )
+        if not activation.get("ok"):
+            reason = str(activation.get("reason") or "web_activation_failed")
+            detail = (
+                f"web_activation:{reason}:"
+                f"session={activation.get('auth_session_status', 0)}:"
+                f"settings={activation.get('user_settings_status', 0)}:"
+                f"dom={activation.get('dom_state', 'unknown')}"
+            )[:240]
             try:
-                with open(self.accounts_output_file, "a", encoding="utf-8") as f:
-                    f.write(line)
-            except Exception as file_exc:
-                logf(f"[Debug] 保存账号文件失败: {file_exc}")
+                mark_error(email, password, reason=detail)
+            except Exception:
+                pass
+            with self.stats_lock:
+                self.activation_failed_count += 1
+            raise ActivationFailedRegistration(email, detail)
         try:
-            mark_used(email, password)
+            settle_seconds = max(
+                0.0,
+                float(config.get("registration_post_activation_settle_sec", 5) or 0),
+            )
         except Exception:
-            pass
-        logf(f"[+] 注册成功: {email}")
-        add_token_to_grok2api_pools(sso, email=email, log_callback=logf)
+            settle_seconds = 5.0
+        if settle_seconds > 0:
+            logf(f"[activation] 会话完成，等待 {settle_seconds:g}s 后执行 OIDC 健康门")
+            sleep_with_cancel(settle_seconds, self.should_stop)
+        result_record = {"email": email, "sso": sso, "profile": profile}
+        result_record["activation"] = activation
         try:
             page = _get_page()
         except Exception:
@@ -4284,6 +4824,49 @@ class GrokRegisterGUI:
             cancel_callback=self.should_stop,
         )
         result_record["cpa"] = cpa_result
+        if self.should_stop():
+            try:
+                mark_error(email, password, reason="cancelled")
+            except Exception:
+                pass
+            raise RegistrationCancelled()
+        if cpa_result.get("rejected"):
+            rejection_summary = str(
+                cpa_result.get("rejection_summary")
+                or cpa_result.get("error")
+                or "health_gate_rejected"
+            )[:240]
+            try:
+                mark_error(email, password, reason=rejection_summary)
+            except Exception:
+                pass
+            with self.stats_lock:
+                self.health_rejected_count += 1
+            logf(f"[-] 健康门淘汰候选，不落盘并准备补号: {email} ({rejection_summary})")
+            raise PermissionDeniedRegistration(email)
+
+        health = cpa_result.get("health") if isinstance(cpa_result, dict) else None
+        classification = health.get("classification") if isinstance(health, dict) else "unknown"
+        if classification != "healthy":
+            logf(f"[health] 非明确权限拒绝，按配置保留: {classification}")
+
+        with self.stats_lock:
+            line = f"{email}----{password}----{sso}\n"
+            with open(self.accounts_output_file, "a", encoding="utf-8") as f:
+                f.write(line)
+            self.results.append(result_record)
+            self.success_count += 1
+        try:
+            mark_used(email, password)
+        except Exception:
+            pass
+        if cookies and PERF_FLAGS.get("cookie_snapshot", True):
+            save_exported_cookies_snapshot(cookies, "success", email)
+        add_token_to_grok2api_pools(sso, email=email, log_callback=logf)
+        if classification == "healthy":
+            logf(f"[+] 注册成功并通过健康门: {email}")
+        else:
+            logf(f"[+] 注册成功，健康结果按策略保留: {email} ({classification})")
 
     def _worker_loop(self, worker_id, total, task_queue):
         prefix = f"[T{worker_id}]"
@@ -4291,9 +4874,14 @@ class GrokRegisterGUI:
         try:
             while not self.should_stop_scheduling():
                 try:
-                    idx = task_queue.get_nowait()
+                    task = task_queue.get_nowait()
                 except queue.Empty:
                     break
+                if isinstance(task, int):
+                    task = {"idx": task, "slot": task, "replacement": 0}
+                idx = int(task.get("idx") or 0)
+                slot = int(task.get("slot") or idx)
+                replacement = int(task.get("replacement", 0) or 0)
                 logf(f"--- 开始第 {idx}/{total} 个账号 ---")
                 try:
                     start_browser(log_callback=logf)
@@ -4302,6 +4890,28 @@ class GrokRegisterGUI:
                 except RegistrationCancelled:
                     logf("[!] 注册被用户停止")
                     break
+                except (PermissionDeniedRegistration, ActivationFailedRegistration) as rejection:
+                    raw_limit = config.get("registration_health_max_replacements_per_slot", 3)
+                    max_replacements = max(0, int(3 if raw_limit is None else raw_limit))
+                    if replacement < max_replacements and not self.should_stop_scheduling():
+                        with self.stats_lock:
+                            next_idx = getattr(self, "next_attempt_idx", total + 1)
+                            self.next_attempt_idx = next_idx + 1
+                        task_queue.put(
+                            {
+                                "idx": next_idx,
+                                "slot": slot,
+                                "replacement": replacement + 1,
+                            }
+                        )
+                        logf(
+                            f"[health] 槽位 {slot} 候选淘汰({type(rejection).__name__})，自动补注册 "
+                            f"{replacement + 1}/{max_replacements}"
+                        )
+                    else:
+                        with self.stats_lock:
+                            self.fail_count += 1
+                        logf(f"[health] 槽位 {slot} 已达到最大补号次数")
                 except CustomMailCapacityExhausted as exc:
                     self.mail_capacity_exhausted = True
                     logf(f"[!] {exc}；停止派发剩余注册任务")
@@ -4325,7 +4935,8 @@ class GrokRegisterGUI:
     def run_registration(self, count, worker_count):
         task_queue = queue.Queue()
         for i in range(1, count + 1):
-            task_queue.put(i)
+            task_queue.put({"idx": i, "slot": i, "replacement": 0})
+        self.next_attempt_idx = count + 1
         workers = []
         try:
             try:

@@ -48,6 +48,7 @@ cpa_auths/*
 # 浏览器 / 调试运行时
 cookies/
 screenshots/
+manual_registration_traces/
 *.log
 *.bak
 *.tmp

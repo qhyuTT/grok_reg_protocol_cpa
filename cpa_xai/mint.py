@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import time
 from pathlib import Path
 from typing import Any, Callable
 
@@ -9,7 +11,7 @@ from .browser_confirm import mint_with_browser
 from .probe import probe_mini_response, probe_models
 from .protocol_mint import ProtocolMintError, extract_sso_from_cookies, mint_with_sso_protocol
 from .proxyutil import proxy_log_label, resolve_proxy, set_runtime_proxy
-from .schema import DEFAULT_BASE_URL, build_cpa_xai_auth
+from .schema import DEFAULT_BASE_URL, build_cpa_xai_auth, jwt_payload
 from .writer import write_cpa_xai_auth
 
 LogFn = Callable[[str], None]
@@ -17,6 +19,49 @@ LogFn = Callable[[str], None]
 
 def _noop(_: str) -> None:
     return None
+
+
+def _safe_token_metadata(access_token: str) -> dict[str, Any]:
+    try:
+        claims = jwt_payload(access_token)
+    except Exception:
+        return {}
+    subject = str(claims.get("sub") or claims.get("principal_id") or "")
+    return {
+        "iss": claims.get("iss"),
+        "aud": claims.get("aud"),
+        "scope": claims.get("scope") or claims.get("scp"),
+        "client_id": claims.get("client_id") or claims.get("azp"),
+        "iat": claims.get("iat"),
+        "exp": claims.get("exp"),
+        "sub_hash": hashlib.sha256(subject.encode()).hexdigest()[:16] if subject else "",
+    }
+
+
+def _wait_with_cancel(seconds: float, cancel: Callable[[], bool] | None) -> bool:
+    deadline = time.monotonic() + max(0.0, float(seconds))
+    while time.monotonic() < deadline:
+        if cancel and cancel():
+            return False
+        time.sleep(min(0.25, max(0.0, deadline - time.monotonic())))
+    return not (cancel and cancel())
+
+
+def _health_rejection_summary(health: dict[str, Any]) -> str:
+    classification = str(health.get("classification") or "unknown")
+    status = int(health.get("http_status") or 0)
+    code = str(health.get("error_code") or "").strip()
+    attempts = len(health.get("attempts") or [])
+    parts = [classification]
+    if status:
+        parts.append(f"http={status}")
+    if code:
+        safe_code = "".join(ch for ch in code if ch.isalnum() or ch in "._-")[:80]
+        if safe_code:
+            parts.append(f"code={safe_code}")
+    if attempts:
+        parts.append(f"attempts={attempts}")
+    return ":".join(parts)
 
 
 def mint_and_export(
@@ -39,10 +84,14 @@ def mint_and_export(
     prefer_protocol: bool = True,
     protocol_only: bool = False,
     protocol_poll_timeout_sec: float = 90.0,
+    health_check: bool = False,
+    health_probe_delays: list[float] | tuple[float, ...] = (0,),
+    health_reject_inconclusive: bool = True,
+    write_auth: bool = True,
     log: LogFn | None = None,
     cancel: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
-    """Full pipeline: (protocol SSO device-flow |) browser device-auth → write CPA → probe.
+    """Full pipeline: mint OIDC → optional health gate → optional write → legacy probe.
 
     Protocol path (curl_cffi + sso cookie) is tried first when prefer_protocol
     and an sso cookie is available. On failure, falls back to browser mint unless
@@ -157,6 +206,90 @@ def mint_and_export(
                 "protocol_error": protocol_err,
             }
 
+    result: dict[str, Any] = {
+        "ok": True,
+        "email": email,
+        "user_code": tokens.get("user_code"),
+        "base_url": base_url,
+        "proxy": proxy_log_label(resolved),
+        "mint_method": tokens.get("mint_method") or "browser",
+        "token_metadata": _safe_token_metadata(str(tokens.get("access_token") or "")),
+    }
+    if protocol_err and result["mint_method"] != "protocol":
+        result["protocol_error"] = protocol_err
+
+    if cancel and cancel():
+        return {**result, "ok": False, "error": "cancelled"}
+
+    if health_check:
+        from .inspection import aggregate_health_attempts, inspect_access_token
+
+        delays = sorted({max(0.0, float(value)) for value in (health_probe_delays or (0,))})
+        if not delays:
+            delays = [0.0]
+        health_started = time.monotonic()
+        attempts: list[dict[str, Any]] = []
+        for attempt_index, offset in enumerate(delays, 1):
+            remaining = offset - (time.monotonic() - health_started)
+            if remaining > 0 and not _wait_with_cancel(remaining, cancel):
+                return {**result, "ok": False, "error": "cancelled"}
+            try:
+                attempt = inspect_access_token(
+                    tokens["access_token"],
+                    base_url=base_url,
+                    proxy=resolved or None,
+                )
+            except Exception as exc:  # noqa: BLE001
+                attempt = {
+                    "classification": "probe_error",
+                    "confidence": "inconclusive",
+                    "http_status": 0,
+                    "error_message": str(exc),
+                }
+            attempt["attempt"] = attempt_index
+            attempt["offset_sec"] = offset
+            attempts.append(attempt)
+            log(
+                "health attempt=%s/%s classification=%s confidence=%s "
+                "status=%s code=%s fallback=%s error=%s"
+                % (
+                    attempt_index,
+                    len(delays),
+                    attempt.get("classification"),
+                    attempt.get("confidence"),
+                    attempt.get("http_status"),
+                    attempt.get("error_code"),
+                    attempt.get("fallback_status"),
+                    str(attempt.get("error_message") or "")[:200],
+                )
+            )
+            if attempt.get("classification") == "healthy":
+                break
+
+        health = aggregate_health_attempts(
+            attempts,
+            reject_inconclusive=health_reject_inconclusive,
+        )
+        result["health"] = health
+        log(
+            "health: classification=%s status=%s model=%s error=%s"
+            % (
+                health.get("classification"),
+                health.get("http_status"),
+                health.get("model"),
+                str(health.get("error_message") or "")[:200],
+            )
+        )
+        if health.get("reject_candidate"):
+            result["ok"] = False
+            result["rejected"] = True
+            result["error"] = health.get("reason") or "health gate rejected candidate"
+            result["rejection_summary"] = _health_rejection_summary(health)
+            return result
+
+    if cancel and cancel():
+        return {**result, "ok": False, "error": "cancelled"}
+
     payload = build_cpa_xai_auth(
         email=email,
         access_token=tokens["access_token"],
@@ -165,22 +298,24 @@ def mint_and_export(
         expires_in=tokens.get("expires_in"),
         base_url=base_url,
     )
-    path = write_cpa_xai_auth(auth_dir, payload)
-    log(f"wrote {path}")
+    if write_auth:
+        path = write_cpa_xai_auth(auth_dir, payload)
+        result["path"] = str(path)
+        log(f"wrote {path}")
+        if cancel and cancel():
+            try:
+                Path(path).unlink(missing_ok=True)
+            except OSError:
+                pass
+            result.pop("path", None)
+            result["ok"] = False
+            result["error"] = "cancelled"
+            return result
+    else:
+        result["export_skipped"] = True
+        log("health-only mint complete; CPA file export disabled")
 
-    result: dict[str, Any] = {
-        "ok": True,
-        "email": email,
-        "path": str(path),
-        "user_code": tokens.get("user_code"),
-        "base_url": base_url,
-        "proxy": proxy_log_label(resolved),
-        "mint_method": tokens.get("mint_method") or "browser",
-    }
-    if protocol_err and result["mint_method"] != "protocol":
-        result["protocol_error"] = protocol_err
-
-    if probe:
+    if probe and write_auth:
         pr = probe_models(tokens["access_token"], base_url=base_url, proxy=resolved or None)
         result["probe_models"] = pr
         log(
