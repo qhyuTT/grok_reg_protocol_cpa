@@ -166,6 +166,14 @@ cp config.example.json config.json
 | `custom_mail_accounts_file` | 凭证文件路径（相对项目根） | 默认即可 |
 | `custom_mail_address_prefix` | 地址前缀，生成 `前缀000001@域名` | 如 `swcares` / `reg` |
 | `custom_mail_max_addresses_per_account` | 每条凭证最多分配多少个地址 | 按域名容量设 |
+
+启动时程序会用 `emails_used.txt`、`emails_error.txt` 和当前内存 reservation 计算剩余容量：
+
+- 请求数量超过剩余容量时，自动缩减到可分配数量；
+- 容量为 0 时不启动浏览器；
+- 运行中容量耗尽时停止派发新任务，已在执行的账号可继续收尾。
+
+该上限必须与域名实际可承载地址数量一致；提高数值不会扩充邮箱服务本身的容量。
 | `custom_mail_poll_interval` | IMAP 轮询间隔（秒） | 5 |
 | `custom_mail_recent_seconds` | 只读最近 N 秒邮件，防读到旧码 | 900 |
 | `custom_mail_imap_last_n` | 每轮扫 INBOX 最新 N 封 | 50 |
@@ -209,6 +217,7 @@ uv run python -u register_cli.py --count 10 --threads 1
 | `--threads N` | 注册并发 1–10 |
 | `--accounts-file PATH` | 账本路径，默认 `accounts_cli.txt` |
 | `--mint-workers N` | CPA mint 并发；`-1` 跟 config/auto；`0` 内联 |
+| `--browser-reuse` | 显式复用注册浏览器；默认每账号结束即关闭 |
 | `--no-fast` | 关闭快速模式（多 sleep、可截图，调试用） |
 | `--inline-mint` | 注册线程内直接 mint（调试） |
 

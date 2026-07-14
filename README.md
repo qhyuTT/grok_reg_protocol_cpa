@@ -259,9 +259,11 @@ uv run python grok_register_ttk.py
 成功时：
 
 1. 追加账本 `email----password----sso`
-2. 可选：推 grok2api
+2. 可选：推 grok2api（本地/远端自动入池默认均关闭，需显式启用）
 3. 若 `cpa_export_enabled`：协议 mint（失败则浏览器）→ `cpa_auths/xai-<email>.json`
 4. 若 `cpa_copy_to_hotload`：再拷到 `cpa_hotload_dir`
+
+如需隔离排查 CPA 凭证批量调用问题，见 [DIAGNOSTIC_CLI_PROXY.md](DIAGNOSTIC_CLI_PROXY.md)。
 
 ### B. 存量号补 CPA（只 mint，不重新注册）
 
@@ -326,6 +328,8 @@ curl -sS http://127.0.0.1:8317/v1/chat/completions \
 | `--count N` | 账号**总数目标**（含已有）；已达标则退出 |
 | `--threads N` | 并发 1–10 |
 | `--accounts-file` | 账本路径 |
+| `--browser-reuse` | 显式复用每个注册 worker 的 Chromium；默认每账号结束后关闭 |
+| `--no-browser-reuse` | 兼容旧参数；行为与当前默认相同 |
 
 ---
 
@@ -337,11 +341,14 @@ curl -sS http://127.0.0.1:8317/v1/chat/completions \
 | 协议 verify/approve 失败 | 会话态变化 / 风控；看日志后自动回退浏览器 |
 | 一直 `authorization_pending` | 浏览器路径未完成 consent；需到「设备已授权」且 token 200 |
 | Cloudflare / Turnstile | 回退浏览器时关 headless、开 turnstilePatch、检查代理 |
+| 注册后遗留多个空白浏览器 | 新版默认每账号关闭并校验 PID 退出；批量性能优先时才使用 `--browser-reuse` |
 | Hotmail 收不到码 | 检查四段凭证、ClientID/Token、IMAP 主机与 alias 计数 |
 | 有 token 但无 grok-4.5 | `cpa_base_url` 是否为 `cli-chat-proxy` |
 | 注册成功但无 `cpa_auths` | `cpa_export_enabled`？看 `cpa_auth_failed.txt` |
 
 调试原则：以 **token 端点返回 `access_token` + refresh_token** 为准；probe 看 `/v1/models` 是否含 `grok-4.5`。
+
+账号“存活”应以单凭证隔离环境中的一次上游模型请求为准。静态认证字段和 `/v1/models` probe 只表示凭证结构或基础认证状态，不等价于账号一定可以完成模型请求。批量停用排查请使用 [DIAGNOSTIC_CLI_PROXY.md](DIAGNOSTIC_CLI_PROXY.md)，保持注册、CPA 和调用出口一致，并关闭跨凭证重试。
 
 ---
 

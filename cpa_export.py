@@ -73,6 +73,7 @@ def export_cpa_xai_for_account(
     sso: str | None = None,
     config: dict | None = None,
     log_callback: Callable[[str], None] | None = None,
+    cancel: Callable[[], bool] | None = None,
 ) -> dict:
     """Mint OIDC + write xai-<email>.json under register cpa_auths (and optional CPA auth-dir)."""
     cfg = config or {}
@@ -190,6 +191,7 @@ def export_cpa_xai_for_account(
         protocol_only=protocol_only,
         protocol_poll_timeout_sec=protocol_poll_timeout,
         log=_log,
+        cancel=cancel,
     )
     if result.get("mint_method"):
         log(f"[cpa] mint_method={result.get('mint_method')}")

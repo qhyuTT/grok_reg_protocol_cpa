@@ -32,6 +32,8 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlparse
 
+from browser_lifecycle import cleanup_failed_browser_start, close_owned_browser
+
 LogFn = Callable[[str], None]
 
 
@@ -240,17 +242,22 @@ def create_standalone_page(
     else:
         log("browser proxy=(none)")
 
-    browser = Chromium(opts)
-    page = browser.latest_tab
+    try:
+        browser = Chromium(opts)
+    except BaseException:  # noqa: BLE001
+        cleanup_failed_browser_start(opts)
+        raise
+    try:
+        page = browser.latest_tab
+    except BaseException:  # noqa: BLE001
+        close_owned_browser(browser)
+        raise
     log("standalone chromium started")
     return browser, page
 
 
 def close_standalone(browser: Any) -> None:
-    try:
-        browser.quit()
-    except Exception:
-        pass
+    close_owned_browser(browser)
 
 
 # ── mint browser reuse (per-thread) ──

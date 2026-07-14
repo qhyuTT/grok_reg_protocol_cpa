@@ -84,6 +84,8 @@ def mint_and_export(
         except ProtocolMintError as e:
             protocol_err = str(e)
             log(f"mint protocol failed: {e}")
+            if cancel and cancel():
+                return {"ok": False, "email": email, "error": "cancelled"}
             if protocol_only:
                 return {
                     "ok": False,
@@ -116,6 +118,8 @@ def mint_and_export(
         log("mint protocol disabled → browser")
 
     if tokens is None:
+        if cancel and cancel():
+            return {"ok": False, "email": email, "error": "cancelled"}
         if not password:
             return {
                 "ok": False,

@@ -49,6 +49,8 @@ cd /Users/nameqhyu/WorkSpace/grok_reg-protocol_cpa
 uv run python -u register_cli.py --extra 1 --threads 1
 ```
 
+CLI 默认在每个账号结束后完整关闭注册浏览器；只有确认需要批量性能时才加 `--browser-reuse` 显式复用。
+
 批量注册时可调整 `--extra` 和 `--threads`，但不建议一开始使用过高并发。
 
 ## 使用 CustomMail 自有域名邮箱
@@ -125,5 +127,5 @@ curl -I --proxy http://192.168.31.206:7890 https://accounts.x.ai
 - 提示找不到 `mail_credentials.txt`：按上文复制模板并填写真实 Hotmail OAuth 凭证。
 - 代理连接失败：确认代理设备 IP 未变化、代理程序正在监听 `7890`，并允许局域网连接。
 - 修改 `config.json` 后未生效：完全退出 GUI 后重新运行启动命令。
-- 注册成功但远端导入失败：`grok2api_auto_add_remote` 启用时，还需要启动 `config.json` 指向的 grok2api 服务并配置有效的 app key；不使用该功能时可将其关闭。
+- grok2api 本地/远端自动入池默认均关闭，手动入池不受影响。显式启用 `grok2api_auto_add_remote` 时，需启动对应服务并配置有效 app key。
 - 浏览器无法启动：确认 Google Chrome/Chromium 已安装，并避免已有调试端口冲突。

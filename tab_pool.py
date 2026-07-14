@@ -10,7 +10,7 @@ Interface:
 
 Notes:
     - One Chromium per worker thread (cookie isolation).
-    - Prefer clear_session() between accounts; release_tab() only on errors / GC.
+    - Default callers close per account; explicit reuse uses clear_session().
     - _all_browsers is pruned on release to avoid zombie list growth.
 """
 
@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import threading
 from typing import Any
+
+from browser_lifecycle import cleanup_failed_browser_start, close_owned_browser
 
 
 class TabPool:
@@ -28,6 +30,10 @@ class TabPool:
     _thread_local = threading.local()
     _all_browsers: list[Any] = []
     _all_browsers_lock = threading.Lock()
+    _lifecycle_lock = threading.RLock()
+    _accept_new = True
+    _permanent_block = False
+    _failed_closes: set[int] = set()
 
     # ── public ──
 
@@ -47,15 +53,36 @@ class TabPool:
     def _create_browser(cls):
         from DrissionPage import Chromium
 
-        with cls._options_lock:
-            factory = cls._options_factory
-        if factory is None:
-            return None
-        options = factory()
-        browser = Chromium(options)
-        with cls._all_browsers_lock:
-            cls._all_browsers.append(browser)
-        return browser
+        with cls._lifecycle_lock:
+            if not cls._accept_new:
+                raise RuntimeError("browser creation disabled during shutdown")
+            with cls._options_lock:
+                factory = cls._options_factory
+            if factory is None:
+                return None
+            options = factory()
+            try:
+                browser = Chromium(options)
+            except BaseException:  # noqa: BLE001
+                cleanup_failed_browser_start(options)
+                raise
+            with cls._all_browsers_lock:
+                cls._all_browsers.append(browser)
+            return browser
+
+    @classmethod
+    def allow_new(cls) -> None:
+        """Allow a new batch to create browsers after a non-permanent shutdown."""
+        with cls._lifecycle_lock:
+            with cls._all_browsers_lock:
+                remaining = len(cls._all_browsers)
+            if remaining:
+                raise RuntimeError(
+                    f"cannot enable browser creation while {remaining} Chromium instance(s) remain"
+                )
+            cls._failed_closes.clear()
+            cls._permanent_block = False
+            cls._accept_new = True
 
     @classmethod
     def _unregister(cls, browser) -> None:
@@ -68,23 +95,39 @@ class TabPool:
                 pass
 
     @classmethod
+    def _is_registered(cls, browser) -> bool:
+        with cls._all_browsers_lock:
+            return any(item is browser for item in cls._all_browsers)
+
+    @classmethod
     def get_tab(cls, url=None):
         """Return current thread tab; create Chromium on first use."""
         tab = getattr(cls._thread_local, "tab", None)
         if tab is not None:
             return tab
+        stale_browser = getattr(cls._thread_local, "browser", None)
+        if stale_browser is not None and not cls.release_tab():
+            raise RuntimeError("previous Chromium could not be closed; refusing to create another")
         browser = cls._create_browser()
         if browser is None:
             raise RuntimeError("TabPool not initialized — call init() first")
-        tab_ids = browser.tab_ids
-        if tab_ids:
-            tab = browser.get_tab(tab_ids[0])
-        else:
-            tab = browser.new_tab()
+        # Bind ownership before touching tabs. Browser startup may succeed while
+        # the first CDP/tab lookup fails; release_tab() must still be able to
+        # find and close that process.
         cls._thread_local.browser = browser
-        cls._thread_local.tab = tab
+        cls._thread_local.tab = None
         cls._thread_local.served = 0
-        return tab
+        try:
+            tab_ids = browser.tab_ids
+            if tab_ids:
+                tab = browser.get_tab(tab_ids[0])
+            else:
+                tab = browser.new_tab()
+            cls._thread_local.tab = tab
+            return tab
+        except BaseException:  # noqa: BLE001
+            cls.release_tab()
+            raise
 
     @classmethod
     def sync_tab(cls):
@@ -188,23 +231,29 @@ class TabPool:
         return int(getattr(cls._thread_local, "served", 0) or 0)
 
     @classmethod
-    def release_tab(cls):
-        """Quit current thread Chromium and unregister it."""
-        browser = getattr(cls._thread_local, "browser", None)
-        if browser is not None:
-            try:
-                browser.quit(del_data=True)
-            except TypeError:
-                try:
-                    browser.quit()
-                except Exception:
-                    pass
-            except Exception:
-                pass
-            cls._unregister(browser)
-        cls._thread_local.browser = None
-        cls._thread_local.tab = None
-        cls._thread_local.served = 0
+    def release_tab(cls) -> bool:
+        """Quit current thread Chromium and unregister it when confirmed closed."""
+        with cls._lifecycle_lock:
+            browser = getattr(cls._thread_local, "browser", None)
+            closed = True
+            if browser is not None and cls._is_registered(browser):
+                closed = close_owned_browser(browser)
+                if closed:
+                    cls._failed_closes.discard(id(browser))
+                    cls._unregister(browser)
+            if closed:
+                cls._thread_local.browser = None
+                cls._thread_local.served = 0
+                if not cls._permanent_block and not cls._failed_closes:
+                    cls._accept_new = True
+            else:
+                # Keep ownership so the next get_tab() retries cleanup instead
+                # of silently creating another Chromium alongside it.
+                cls._thread_local.browser = browser
+                cls._failed_closes.add(id(browser))
+                cls._accept_new = False
+            cls._thread_local.tab = None
+            return closed
 
     @classmethod
     def refresh_tab(cls):
@@ -213,22 +262,27 @@ class TabPool:
         return cls.get_tab()
 
     @classmethod
-    def shutdown(cls):
+    def shutdown(cls, *, block_new: bool = False):
         """Quit every browser we still track."""
-        cls.release_tab()
-        with cls._all_browsers_lock:
-            browsers = list(cls._all_browsers)
-            cls._all_browsers.clear()
-        for b in browsers:
-            try:
-                b.quit(del_data=True)
-            except TypeError:
-                try:
-                    b.quit()
-                except Exception:
-                    pass
-            except Exception:
-                pass
+        with cls._lifecycle_lock:
+            if block_new:
+                cls._permanent_block = True
+                cls._accept_new = False
+            with cls._all_browsers_lock:
+                browsers = list(cls._all_browsers)
+            for browser in browsers:
+                if close_owned_browser(browser):
+                    cls._failed_closes.discard(id(browser))
+                    cls._unregister(browser)
+                else:
+                    cls._failed_closes.add(id(browser))
+            if not cls._permanent_block:
+                cls._accept_new = not cls._failed_closes
+            current = getattr(cls._thread_local, "browser", None)
+            if current is not None and not cls._is_registered(current):
+                cls._thread_local.browser = None
+                cls._thread_local.tab = None
+                cls._thread_local.served = 0
 
     @classmethod
     def live_count(cls) -> int:

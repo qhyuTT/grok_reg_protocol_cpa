@@ -88,6 +88,19 @@ def message_matches(msg, target_email: str, allowed_domains, not_before_ts: floa
     return False
 
 
+class CustomMailCapacityExhausted(RuntimeError):
+    """Raised when every configured CustomMail domain has reached its limit."""
+
+    def __init__(self, *, total: int, consumed: int):
+        self.total = int(total)
+        self.consumed = int(consumed)
+        self.remaining = max(0, self.total - self.consumed)
+        super().__init__(
+            "CustomMail 可用地址已耗尽，请增加容量或补充凭证"
+            f"（已用 {self.consumed}/{self.total}）"
+        )
+
+
 class CustomMailPool:
     def __init__(self, config: dict, used_files=()):
         self.config = config
@@ -140,6 +153,28 @@ class CustomMailPool:
                 continue
         return result
 
+    def _capacity_unlocked(self):
+        accounts = self.load_accounts()
+        maximum = max(1, int(self.config.get("custom_mail_max_addresses_per_account", 100) or 100))
+        tracked = self._tracked()
+        consumed = sum(
+            min(maximum, sum(1 for addr in tracked if addr.endswith("@" + account["domain"])))
+            for account in accounts
+        )
+        total = len(accounts) * maximum
+        return {
+            "accounts": len(accounts),
+            "per_account": maximum,
+            "total": total,
+            "consumed": consumed,
+            "remaining": max(0, total - consumed),
+        }
+
+    def capacity(self):
+        """Return a consistent snapshot of configured and remaining addresses."""
+        with self._lock:
+            return self._capacity_unlocked()
+
     def allocate(self):
         prefix = re.sub(r"[^a-z0-9_-]", "", str(self.config.get("custom_mail_address_prefix", "reg")).lower()) or "reg"
         maximum = max(1, int(self.config.get("custom_mail_max_addresses_per_account", 100) or 100))
@@ -158,7 +193,10 @@ class CustomMailPool:
                     token = "custommail:" + secrets.token_urlsafe(18)
                     self._tokens[token] = {"account": account, "email": address, "created_at": time.time()}
                     return address, token
-        raise Exception("CustomMail 可用地址已耗尽，请增加容量或补充凭证")
+            capacity = self._capacity_unlocked()
+        raise CustomMailCapacityExhausted(
+            total=capacity["total"], consumed=capacity["consumed"]
+        )
 
     def release(self, email: str):
         with self._lock:

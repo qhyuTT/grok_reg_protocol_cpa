@@ -23,7 +23,7 @@ import json
 from DrissionPage import Chromium, ChromiumOptions
 from DrissionPage.errors import PageDisconnectedError
 from curl_cffi import requests
-from custom_mail import CustomMailPool
+from custom_mail import CustomMailCapacityExhausted, CustomMailPool
 
 
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
@@ -41,7 +41,7 @@ DEFAULT_CONFIG = {
     "enable_nsfw": True,
     "register_count": 1,
     "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
-    "grok2api_auto_add_local": True,
+    "grok2api_auto_add_local": False,
     "grok2api_local_token_file": "",
     "grok2api_pool_name": "ssoBasic",
     "grok2api_auto_add_remote": False,
@@ -146,6 +146,11 @@ def _get_custom_mail_pool():
     return _custom_mail_pool
 
 
+def get_custom_mail_capacity():
+    """Return the current CustomMail capacity snapshot without reserving an address."""
+    return _get_custom_mail_pool().capacity()
+
+
 def _custom_mail_release(email):
     if _custom_mail_pool is not None:
         try:
@@ -163,7 +168,7 @@ PERF_FLAGS = {
     "skip_debug_io": False,  # skip dump_state / take_screenshot
     "cookie_snapshot": True, # save_cookies_snapshot
     "async_side_effects": True,  # grok2api / cookie snapshot in background
-    "browser_reuse": True,   # clear_session instead of quit between accounts
+    "browser_reuse": False,  # default: quit after every account; CLI can opt into reuse
     "browser_recycle_every": 25,  # full quit+recreate after N successful reuses
 }
 
@@ -600,7 +605,7 @@ def add_token_to_grok2api_remote_pool(raw_token, email="", log_callback=None):
 
 def _add_token_to_grok2api_pools_sync(raw_token, email="", log_callback=None):
     # SSO 账本只写 accounts_cli.txt；不再本地备份 tokens/grok/
-    if config.get("grok2api_auto_add_local", True):
+    if config.get("grok2api_auto_add_local", False):
         try:
             add_token_to_grok2api_local_pool(raw_token, email=email, log_callback=log_callback)
         except Exception as exc:
@@ -616,6 +621,10 @@ def _add_token_to_grok2api_pools_sync(raw_token, email="", log_callback=None):
 
 def add_token_to_grok2api_pools(raw_token, email="", log_callback=None):
     """Push SSO into grok2api pools. Async by default so register path never blocks on dead :8000."""
+    if not config.get("grok2api_auto_add_local", False) and not config.get(
+        "grok2api_auto_add_remote", False
+    ):
+        return
     if PERF_FLAGS.get("async_side_effects", True):
         def _job():
             try:
@@ -2298,6 +2307,8 @@ def start_browser(log_callback=None):
                 TabPool.release_tab()
             except Exception:
                 pass
+            if "browser creation disabled during shutdown" in str(exc):
+                raise
             human_sleep(min(1.5 * attempt, 4))
     raise Exception(f"浏览器启动失败，已重试4次: {last_exc}")
 
@@ -2308,27 +2319,28 @@ def stop_browser():
 
 
 def prepare_browser_for_next_account(log_callback=None, force_recycle: bool = False):
-    """Between accounts: clear session (reuse) or full recycle.
+    """Finish the current account: clear for reuse or close for lazy recreation.
 
     Returns (browser, page).
     """
-    reuse = bool(PERF_FLAGS.get("browser_reuse", True)) and not force_recycle
+    reuse = bool(PERF_FLAGS.get("browser_reuse", False)) and not force_recycle
     every = int(PERF_FLAGS.get("browser_recycle_every", 25) or 25)
     served = TabPool.served_count()
     if reuse and TabPool.get_browser() is not None and (every <= 0 or served < every):
         if TabPool.clear_session(log_callback=log_callback):
             TabPool.mark_served()
             return TabPool.get_browser(), _get_page()
-    # full recycle
+    # Close now; the next account starts lazily. Do not create an unused blank
+    # browser after the final task or while CPA mint is running.
     if log_callback:
         log_callback(f"[*] 浏览器完整回收（reuse={reuse}, served={served}, every={every}）")
     TabPool.release_tab()
-    return start_browser(log_callback=log_callback)
+    return None, None
 
 
-def shutdown_browser():
+def shutdown_browser(*, block_new: bool = False):
     """Quit all tracked Chromium instances."""
-    TabPool.shutdown()
+    TabPool.shutdown(block_new=block_new)
 
 
 def restart_browser(log_callback=None):
@@ -3485,7 +3497,15 @@ def login_and_get_sso(email, password, log_callback=None, cancel_callback=None):
     return sso
 
 
-def export_cpa_after_success(email, password, sso, page=None, log_callback=None):
+def export_cpa_after_success(
+    email,
+    password,
+    sso,
+    page=None,
+    cookies=None,
+    log_callback=None,
+    cancel_callback=None,
+):
     """GUI 成功注册后的 CPA xai-*.json 导出 hook。"""
     log = log_callback or (lambda m: print(m, flush=True))
     if not config.get("cpa_export_enabled", True):
@@ -3500,12 +3520,12 @@ def export_cpa_after_success(email, password, sso, page=None, log_callback=None)
         log(f"[cpa] 导入 cpa_export 失败: {exc}")
         return {"ok": False, "error": f"import: {exc}"}
 
-    cookies = []
-    try:
-        cookies = cpa_export.export_cookies_from_page(page) if page is not None else []
-    except Exception as exc:
-        log(f"[cpa] cookie 导出失败，继续用邮箱密码 mint: {exc}")
-        cookies = []
+    if cookies is None:
+        try:
+            cookies = cpa_export.export_cookies_from_page(page) if page is not None else []
+        except Exception as exc:
+            log(f"[cpa] cookie 导出失败，继续用邮箱密码 mint: {exc}")
+            cookies = []
     if cookies:
         log(f"[cpa] 已导出 cookie {len(cookies)} 条供 OIDC mint 注入")
 
@@ -3526,6 +3546,7 @@ def export_cpa_after_success(email, password, sso, page=None, log_callback=None)
                 sso=sso,
                 config=cpa_cfg,
                 log_callback=log,
+                cancel=cancel_callback,
             )
         except Exception as exc:
             log(f"[cpa] CPA 导出异常: {exc}")
@@ -3556,7 +3577,9 @@ class GrokRegisterGUI:
         self.accounts_output_file = ""
         self.stats_lock = threading.Lock()
         self._tutorial_window = None
+        self._registration_thread = None
         self.setup_ui()
+        self.root.protocol("WM_DELETE_WINDOW", self.close_application)
         self.root.after(200, self._maybe_show_tutorial_on_start)
 
     def setup_ui(self):
@@ -3654,7 +3677,7 @@ class GrokRegisterGUI:
         self.cloudmail_password_entry.grid(row=10, column=1, columnspan=3, sticky=tk.W, padx=5)
 
         ttk.Label(config_frame, text="grok2api 本地自动入池:").grid(row=11, column=0, sticky=tk.W)
-        self.grok2api_local_auto_var = tk.BooleanVar(value=bool(config.get("grok2api_auto_add_local", True)))
+        self.grok2api_local_auto_var = tk.BooleanVar(value=bool(config.get("grok2api_auto_add_local", False)))
         self.grok2api_local_auto_check = ttk.Checkbutton(config_frame, variable=self.grok2api_local_auto_var)
         self.grok2api_local_auto_check.grid(row=11, column=1, sticky=tk.W, padx=5)
 
@@ -3917,7 +3940,7 @@ class GrokRegisterGUI:
 - 本次要注册的总账号数
 
 7) 并发线程
-- 建议先 3-6 稳定后再升到 10
+- CustomMail 建议先用 1，小批验证稳定后最多用 2
 
 8) 代理（可选）
 - 不填=直连
@@ -3928,6 +3951,7 @@ class GrokRegisterGUI:
 - 勾选后成功账号会自动调用接口开启对应设置
 
 【第四步：grok2api 入池（可选）】
+- 本地与远端自动入池默认均关闭；手动入池不受影响
 10) grok2api 本地自动入池
 - 开启后把成功 sso 自动写入本地池
 - 本地 token.json 填 grok2api 的 token.json 路径
@@ -4000,6 +4024,9 @@ class GrokRegisterGUI:
 
     def should_stop(self):
         return self.stop_requested or not self.is_running
+
+    def should_stop_scheduling(self):
+        return self.should_stop() or bool(getattr(self, "mail_capacity_exhausted", False))
 
     def start_registration(self):
         if self.is_running:
@@ -4094,7 +4121,28 @@ class GrokRegisterGUI:
         except Exception:
             self.log("[!] 注册数量无效")
             return
+        if count < 1:
+            self.log("[!] 注册数量必须大于 0")
+            return
+        if config["email_provider"] == "custommail":
+            try:
+                capacity = get_custom_mail_capacity()
+            except Exception as exc:
+                self.log(f"[!] CustomMail 容量检查失败: {exc}")
+                return
+            remaining = int(capacity["remaining"])
+            self.log(
+                f"[*] CustomMail 容量: 剩余 {remaining}/{capacity['total']}，"
+                f"域名数 {capacity['accounts']}"
+            )
+            if remaining <= 0:
+                self.log("[!] CustomMail 地址已耗尽，任务未启动")
+                return
+            if count > remaining:
+                self.log(f"[!] 目标数量 {count} 超过剩余容量，自动缩减为 {remaining}")
+                count = remaining
         self.stop_requested = False
+        self.mail_capacity_exhausted = False
         self.success_count = 0
         self.fail_count = 0
         self.results = []
@@ -4102,20 +4150,42 @@ class GrokRegisterGUI:
         self.accounts_output_file = os.path.join(
             os.path.dirname(__file__), f"accounts_{now}.txt"
         )
+        try:
+            TabPool.allow_new()
+        except Exception as exc:
+            self.log(f"[!] 旧浏览器未完全回收，拒绝启动新批次: {exc}")
+            return
         self.update_stats()
         self._set_running_ui(True)
         worker_count = max(1, min(config.get("register_threads", 1), count))
         self.log(f"[*] 配置已保存，开始执行。目标数量: {count}，并发线程: {worker_count}")
         self.log(f"[*] 成功账号将实时保存到: {self.accounts_output_file}")
-        threading.Thread(
+        self._registration_thread = threading.Thread(
             target=self.run_registration,
             args=(count, worker_count),
             daemon=True,
-        ).start()
+        )
+        self._registration_thread.start()
 
     def stop_registration(self):
         self.stop_requested = True
         self.log("[!] 用户停止注册")
+
+    def close_application(self):
+        """Stop work and close every tracked registration browser before exit."""
+        self.stop_requested = True
+        try:
+            shutdown_browser(block_new=True)
+        except Exception as exc:
+            self.log(f"[Debug] 窗口关闭时回收浏览器失败: {exc}")
+        try:
+            shutdown_browser(block_new=True)
+        except Exception:
+            pass
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
 
     def _run_single_registration(self, idx, total, logf):
         email = ""
@@ -4149,6 +4219,7 @@ class GrokRegisterGUI:
                         pass
                 if ("未收到验证码" in msg or "验证码" in msg) and mail_try < max_mail_retry:
                     logf(f"[!] 本邮箱未取到验证码，自动更换新邮箱重试: {msg}")
+                    raise_if_cancelled(self.should_stop)
                     restart_browser(log_callback=logf)
                     sleep_with_cancel(1, self.should_stop)
                     continue
@@ -4190,13 +4261,27 @@ class GrokRegisterGUI:
             page = _get_page()
         except Exception:
             page = None
+        cookies = []
+        if page is not None:
+            try:
+                import cpa_export
+
+                cookies = cpa_export.export_cookies_from_page(page)
+            except Exception as exc:
+                logf(f"[cpa] cookie 快照失败，继续导出: {exc}")
+        # Registration is complete. Close its Chromium before the potentially
+        # slow protocol/browser CPA mint so windows cannot accumulate behind
+        # the serialized GUI export lock.
+        stop_browser()
         logf("[cpa] 开始自动导出 CPA xai 认证文件")
         cpa_result = export_cpa_after_success(
             email,
             password,
             sso,
-            page=page,
+            page=None,
+            cookies=cookies,
             log_callback=logf,
+            cancel_callback=self.should_stop,
         )
         result_record["cpa"] = cpa_result
 
@@ -4204,28 +4289,33 @@ class GrokRegisterGUI:
         prefix = f"[T{worker_id}]"
         logf = lambda m: self.log(f"{prefix} {m}")
         try:
-            start_browser(log_callback=logf)
-            logf("[*] 浏览器已启动")
-            while not self.should_stop():
+            while not self.should_stop_scheduling():
                 try:
                     idx = task_queue.get_nowait()
                 except queue.Empty:
                     break
                 logf(f"--- 开始第 {idx}/{total} 个账号 ---")
                 try:
+                    start_browser(log_callback=logf)
+                    logf("[*] 浏览器已启动")
                     self._run_single_registration(idx, total, logf)
                 except RegistrationCancelled:
                     logf("[!] 注册被用户停止")
+                    break
+                except CustomMailCapacityExhausted as exc:
+                    self.mail_capacity_exhausted = True
+                    logf(f"[!] {exc}；停止派发剩余注册任务")
                     break
                 except Exception as exc:
                     with self.stats_lock:
                         self.fail_count += 1
                     logf(f"[-] 注册失败: {exc}")
                 finally:
+                    stop_browser()
                     self.update_stats()
-                    if self.should_stop():
-                        break
-                    restart_browser(log_callback=logf)
+                if self.should_stop_scheduling():
+                    break
+                if not task_queue.empty():
                     sleep_with_cancel(1, self.should_stop)
         except Exception as exc:
             logf(f"[!] 线程异常: {exc}")
@@ -4238,26 +4328,35 @@ class GrokRegisterGUI:
             task_queue.put(i)
         workers = []
         try:
-            start_interval = float(config.get("thread_start_interval", 0.8))
-        except Exception:
-            start_interval = 0.8
-        if start_interval < 0:
-            start_interval = 0.0
-        for wid in range(1, worker_count + 1):
-            t = threading.Thread(target=self._worker_loop, args=(wid, count, task_queue), daemon=True)
-            workers.append(t)
-            t.start()
-            if wid < worker_count and start_interval > 0:
-                sleep_with_cancel(start_interval, self.should_stop)
-        for t in workers:
-            t.join()
-        self._set_running_ui(False)
-        self.log("[*] 任务结束")
+            try:
+                start_interval = float(config.get("thread_start_interval", 0.8))
+            except Exception:
+                start_interval = 0.8
+            if start_interval < 0:
+                start_interval = 0.0
+            for wid in range(1, worker_count + 1):
+                if self.should_stop_scheduling():
+                    break
+                t = threading.Thread(target=self._worker_loop, args=(wid, count, task_queue), daemon=True)
+                workers.append(t)
+                t.start()
+                if wid < worker_count and start_interval > 0:
+                    sleep_with_cancel(start_interval, self.should_stop_scheduling)
+            for t in workers:
+                t.join()
+        finally:
+            shutdown_browser()
+            self._set_running_ui(False)
+            self.log("[*] 任务结束")
 
 def main():
     root = tk.Tk()
     app = GrokRegisterGUI(root)
-    root.mainloop()
+    try:
+        root.mainloop()
+    finally:
+        app.stop_requested = True
+        shutdown_browser(block_new=True)
 
 
 if __name__ == "__main__":

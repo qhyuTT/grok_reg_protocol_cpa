@@ -184,12 +184,14 @@ source = { virtual = "." }
 dependencies = [
     { name = "curl-cffi" },
     { name = "drissionpage" },
+    { name = "psutil" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "curl-cffi", specifier = ">=0.7" },
     { name = "drissionpage", specifier = ">=4.1" },
+    { name = "psutil", specifier = ">=5.9" },
 ]
 
 [[package]]

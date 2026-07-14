@@ -5,8 +5,9 @@ Architecture:
   Mint workers (M)      →  cpa_auths/xai-*.json + optional hotload
 
 Browser lifecycle:
-  - One Chromium per register worker, reused via TabPool.clear_session
-  - Full recycle every N accounts or on error
+  - Default: quit the register Chromium after every account
+  - Optional --browser-reuse keeps one Chromium per register worker
+  - Reused browsers are fully recycled every N accounts or on error
   - Register browser released BEFORE mint (mint always standalone Chromium)
   - Peak browsers ≈ R + M (not 2×R)
 """
@@ -122,6 +123,8 @@ _next_idx = [1]
 
 # mint 队列结束哨兵
 _MINT_STOP = object()
+_REGISTER_STOP = threading.Event()
+_REGISTER_CAPACITY_STOP = threading.Event()
 
 
 def resolve_mint_workers(
@@ -169,7 +172,7 @@ def resolve_mint_queue_max(config: dict, mint_workers: int, cli_value: int | Non
 
 class DummyStop:
     def __call__(self) -> bool:
-        return False
+        return _REGISTER_STOP.is_set()
 
 
 def _is_managed_mail_provider() -> bool:
@@ -251,6 +254,10 @@ def register_one(
             )
             log(worker_id, f"验证码: {code}")
             break
+        except reg.CustomMailCapacityExhausted as exc:
+            _REGISTER_CAPACITY_STOP.set()
+            log(worker_id, f"! {exc}；停止派发剩余注册任务")
+            return None
         except Exception as exc:
             msg = str(exc)
             if ("未收到验证码" in msg or "验证码" in msg) and mail_try < max_mail_retry:
@@ -266,10 +273,6 @@ def register_one(
             _mark_email_stage_error(email, msg)
             traceback.print_exc()
             _inc("reg_fail")
-            try:
-                reg.restart_browser(log_callback=lambda m: log(worker_id, m))
-            except Exception:
-                pass
             return None
 
     try:
@@ -313,7 +316,8 @@ def register_one(
         except Exception as exc:
             log(worker_id, f"[Debug] grok2api: {exc}")
 
-        # Release / recycle register browser BEFORE mint so peak browsers ≈ R+M
+        # Close by default (or clear only when reuse was explicitly enabled)
+        # BEFORE mint so registration and CPA browsers do not overlap needlessly.
         try:
             reg.prepare_browser_for_next_account(log_callback=lambda m: log(worker_id, m))
         except Exception:
@@ -351,10 +355,6 @@ def register_one(
         reg.mark_error(email or "", reason=str(exc)[:120])
         traceback.print_exc()
         _inc("reg_fail")
-        try:
-            reg.restart_browser(log_callback=lambda m: log(worker_id, m))
-        except Exception:
-            pass
         return None
 
 
@@ -381,6 +381,7 @@ def _run_mint_job(worker_id: int | str, job: dict[str, Any], config: dict) -> di
             sso=job.get("sso") or "",
             config=config,
             log_callback=lambda m: log(worker_id, m),
+            cancel=_REGISTER_STOP.is_set,
         )
         if result.get("ok"):
             log(worker_id, f"+ CPA auth: {result.get('path')}")
@@ -408,11 +409,13 @@ def _register_worker(
     forever: bool,
     do_mint_inline: bool,
 ):
-    while True:
+    while not _REGISTER_STOP.is_set() and not _REGISTER_CAPACITY_STOP.is_set():
         try:
             idx = task_queue.get_nowait()
         except queue.Empty:
             if not forever:
+                break
+            if _REGISTER_STOP.is_set():
                 break
             with _next_idx_lock:
                 nxt = _next_idx[0]
@@ -422,7 +425,8 @@ def _register_worker(
             continue
 
         retry = 0
-        while retry < 2:
+        while retry < 2 and not _REGISTER_STOP.is_set() and not _REGISTER_CAPACITY_STOP.is_set():
+            result = None
             try:
                 result = register_one(
                     worker_id,
@@ -434,20 +438,22 @@ def _register_worker(
                 )
                 if result:
                     break
+                if _REGISTER_CAPACITY_STOP.is_set():
+                    break
                 retry += 1
-                if retry < 2:
+                if retry < 2 and not _REGISTER_STOP.is_set():
                     log(worker_id, f"[retry] 账号 {idx} 失败，重试 {retry}/1")
-                    try:
-                        reg.restart_browser(log_callback=lambda m: log(worker_id, m))
-                    except Exception:
-                        pass
             except Exception:
                 retry += 1
-                if retry < 2:
+                if retry < 2 and not _REGISTER_STOP.is_set():
                     log(worker_id, f"[retry] 账号 {idx} 异常，重试 {retry}/1")
                     traceback.print_exc()
+            finally:
+                # Failed sessions are always dirty. Successful sessions are
+                # also closed unless --browser-reuse was explicitly enabled.
+                if not result or not reg.PERF_FLAGS.get("browser_reuse", False):
                     try:
-                        reg.restart_browser(log_callback=lambda m: log(worker_id, m))
+                        reg.stop_browser()
                     except Exception:
                         pass
 
@@ -483,7 +489,7 @@ def _mint_worker(worker_id: str, mint_queue: queue.Queue, config: dict):
     log(worker_id, "mint worker exit")
 
 
-def main() -> int:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="CLI runner for grok_register_ttk (pipelined).")
     parser.add_argument("--count", type=int, default=1, help="账号总数目标（0=不限；含已有）")
     parser.add_argument(
@@ -508,11 +514,27 @@ def main() -> int:
     parser.add_argument("--accounts-file", default=os.path.join(os.path.dirname(__file__), "accounts_cli.txt"))
     parser.add_argument("--fast", action="store_true", default=True, help="快速模式（默认开）：压缩 sleep、关截图")
     parser.add_argument("--no-fast", action="store_true", help="关闭快速模式")
-    parser.add_argument("--no-browser-reuse", action="store_true", help="每号强制 quit 浏览器")
+    browser_group = parser.add_mutually_exclusive_group()
+    browser_group.add_argument(
+        "--browser-reuse",
+        action="store_true",
+        help="显式复用每个注册 worker 的浏览器（默认每账号关闭）",
+    )
+    browser_group.add_argument(
+        "--no-browser-reuse",
+        action="store_true",
+        help="兼容旧参数：每账号关闭浏览器（已是默认）",
+    )
     parser.add_argument("--browser-recycle-every", type=int, default=25, help="复用 N 次后完整回收")
     parser.add_argument("--cookie-snapshot", action="store_true", help="注册成功写 cookie 快照（默认关，fast）")
     parser.add_argument("--inline-mint", action="store_true", help="强制注册线程内联 mint（调试用）")
-    args = parser.parse_args()
+    return parser
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    _REGISTER_STOP.clear()
+    _REGISTER_CAPACITY_STOP.clear()
 
     reg.load_config()
     cfg0 = getattr(reg, "config", {}) or {}
@@ -539,7 +561,7 @@ def main() -> int:
         skip_debug_io=fast,
         cookie_snapshot=bool(args.cookie_snapshot) or not fast,
         async_side_effects=True,
-        browser_reuse=not args.no_browser_reuse,
+        browser_reuse=bool(args.browser_reuse) and not bool(args.no_browser_reuse),
         browser_recycle_every=max(1, int(args.browser_recycle_every)),
     )
 
@@ -578,10 +600,35 @@ def main() -> int:
         print("[*] 所有账号已完成，无需继续（可用 --extra N 再注册）", flush=True)
         return 0
 
+    if str(cfg0.get("email_provider") or "").strip().lower() in {"custommail", "custom_mail"}:
+        try:
+            capacity = reg.get_custom_mail_capacity()
+        except Exception as exc:
+            print(f"[!] CustomMail 容量检查失败: {exc}", flush=True)
+            return 1
+        available = int(capacity["remaining"])
+        print(
+            f"[*] CustomMail 容量: 剩余 {available}/{capacity['total']}，"
+            f"域名数 {capacity['accounts']}",
+            flush=True,
+        )
+        if available <= 0:
+            print("[!] CustomMail 地址已耗尽，任务未启动", flush=True)
+            return 1
+        if remaining is None or remaining > available:
+            requested = "不限" if remaining is None else str(remaining)
+            remaining = available
+            args.count = done_count + available
+            print(
+                f"[!] 待注册数量 {requested} 超过剩余容量，自动缩减为 {available}",
+                flush=True,
+            )
+
     log_thread = threading.Thread(target=_log_writer, daemon=True)
     log_thread.start()
 
     try:
+        reg.TabPool.allow_new()
         reg.TabPool.init(reg.create_browser_options, log_callback=lambda m: log(0, m))
     except Exception as exc:
         print(f"[!] 浏览器初始化失败: {exc}", flush=True)
@@ -634,6 +681,13 @@ def main() -> int:
             t.join()
     except KeyboardInterrupt:
         print("\n[!] 用户中断", flush=True)
+        _REGISTER_STOP.set()
+        try:
+            reg.shutdown_browser(block_new=True)
+        except Exception:
+            pass
+        for t in reg_threads:
+            t.join(timeout=30)
 
     # drain mint queue
     if mint_queue is not None:
@@ -645,7 +699,7 @@ def main() -> int:
             t.join(timeout=600)
 
     try:
-        reg.shutdown_browser()
+        reg.shutdown_browser(block_new=True)
     except Exception:
         pass
 

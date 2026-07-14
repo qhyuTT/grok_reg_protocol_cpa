@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from custom_mail import (
+    CustomMailCapacityExhausted,
     CustomMailPool,
     message_matches,
     normalize_app_password,
@@ -113,6 +114,23 @@ class CustomMailPoolTests(unittest.TestCase):
         reallocated, _ = pool.allocate()
 
         self.assertEqual(reallocated, address)
+
+    def test_capacity_counts_ledgers_and_reservations_and_raises_typed_error(self):
+        self.used.write_text("reg000001@example.com--------ok\n", encoding="utf-8")
+        pool = self.make_pool(["example.com----inbox@gmail.com----aaaa bbbb cccc dddd"])
+
+        self.assertEqual(pool.capacity()["remaining"], 1)
+        address, _ = pool.allocate()
+        self.assertEqual(address, "reg000002@example.com")
+        self.assertEqual(pool.capacity()["remaining"], 0)
+
+        with self.assertRaises(CustomMailCapacityExhausted) as raised:
+            pool.allocate()
+
+        self.assertEqual(raised.exception.total, 2)
+        self.assertEqual(raised.exception.consumed, 2)
+        pool.release(address)
+        self.assertEqual(pool.capacity()["remaining"], 1)
 
     def test_get_code_uses_readonly_imap_and_normalized_password(self):
         pool = self.make_pool(["example.com----inbox@gmail.com----aaaa bbbb cccc dddd"])
