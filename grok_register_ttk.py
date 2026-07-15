@@ -686,9 +686,11 @@ def add_token_to_grok2api_pools(raw_token, email="", log_callback=None):
     _add_token_to_grok2api_pools_sync(raw_token, email=email, log_callback=log_callback)
 
 
+# 有头真实 Chrome 下不要禁用 GPU/软件光栅化：--disable-gpu 会让 WebGL 退化为
+# SwiftShader 软件渲染，这是自动化环境的强特征。真实用户机器几乎都是硬件 GPU，
+# 因此保留真实 GPU 渲染以避免指纹自曝。--disable-images 只影响加载速度、不影响指纹，
+# 予以保留。
 CHROMIUM_SLIM_FLAGS = [
-    "--disable-gpu",
-    "--disable-software-rasterizer",
     "--no-sandbox",
     "--disable-dev-shm-usage",
     "--disable-images",

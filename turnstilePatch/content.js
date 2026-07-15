@@ -34,15 +34,10 @@
         };
     } catch (e) {}
 
-    // 4. 修补 plugin 数量，模拟正常浏览器
-    try {
-        Object.defineProperty(navigator, "plugins", {
-            get: function () {
-                return [1, 2, 3, 4, 5];
-            },
-            configurable: true,
-        });
-    } catch (e) {}
+    // 4. 不再伪造 navigator.plugins。
+    // 真实 Chrome 的 plugins 是带 name/MIME 的结构化对象（PDF Viewer 等），
+    // 塞入整数数组会让 plugins[0].name === undefined，比保留真实值更容易被识别为
+    // 自动化环境。这里跑的是真实系统 Chrome，直接使用其原生 plugins 即可。
 
     // 5. 修补 languages 属性
     try {
