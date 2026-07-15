@@ -25,6 +25,7 @@ from DrissionPage.common import Keys
 from DrissionPage.errors import PageDisconnectedError
 from curl_cffi import requests
 from custom_mail import CustomMailCapacityExhausted, CustomMailPool
+from automatic_registration_trace import AutomaticRegistrationTraceBatch, set_active_batch
 
 
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
@@ -61,6 +62,9 @@ DEFAULT_CONFIG = {
     "registration_health_reject_inconclusive": True,
     "registration_health_audit_file": "cpa_auths/registration_health_audit.jsonl",
     "registration_post_activation_settle_sec": 5,
+    "registration_behavior_trace_enabled": False,
+    "registration_behavior_trace_dir": "manual_registration_traces",
+    "registration_behavior_trace_page_interval_sec": 1.0,
     "hotmail_accounts_file": "mail_credentials.txt",
     "hotmail_alias_mode": "random",
     "hotmail_alias_random_length": 8,
@@ -4096,9 +4100,24 @@ class GrokRegisterGUI:
         self.stats_lock = threading.Lock()
         self._tutorial_window = None
         self._registration_thread = None
+        self.behavior_trace = None
+        self._trace_error_reported = False
         self.setup_ui()
         self.root.protocol("WM_DELETE_WINDOW", self.close_application)
         self.root.after(200, self._maybe_show_tutorial_on_start)
+
+    def _trace_call(self, method: str, *args, **kwargs):
+        """Run optional diagnostics without allowing them to break registration."""
+        behavior_trace = getattr(self, "behavior_trace", None)
+        if behavior_trace is None:
+            return None
+        try:
+            return getattr(behavior_trace, method)(*args, **kwargs)
+        except Exception as exc:
+            if not getattr(self, "_trace_error_reported", False):
+                self._trace_error_reported = True
+                self.log(f"[trace] 行为记录异常，注册主流程继续: {exc}")
+            return None
 
     def setup_ui(self):
         load_config()
@@ -4678,6 +4697,29 @@ class GrokRegisterGUI:
         except Exception as exc:
             self.log(f"[!] 旧浏览器未完全回收，拒绝启动新批次: {exc}")
             return
+        self.behavior_trace = None
+        self._trace_error_reported = False
+        TabPool.set_lifecycle_observer(None)
+        set_active_batch(None)
+        if bool(config.get("registration_behavior_trace_enabled", False)):
+            try:
+                self.behavior_trace = AutomaticRegistrationTraceBatch(
+                    config.get("registration_behavior_trace_dir")
+                    or "manual_registration_traces",
+                    page_state_interval=float(
+                        config.get("registration_behavior_trace_page_interval_sec", 1.0)
+                        or 1.0
+                    ),
+                )
+                TabPool.set_lifecycle_observer(self.behavior_trace)
+                set_active_batch(self.behavior_trace)
+                self.log(f"[trace] 自动行为追踪已启用: {self.behavior_trace.session_dir}")
+            except Exception as exc:
+                self.behavior_trace = None
+                TabPool.set_lifecycle_observer(None)
+                set_active_batch(None)
+                self.log(f"[!] 自动行为追踪初始化失败，任务未启动: {exc}")
+                return
         self.update_stats()
         self._set_running_ui(True)
         worker_count = max(1, min(config.get("register_threads", 1), count))
@@ -4721,6 +4763,8 @@ class GrokRegisterGUI:
             open_signup_page(log_callback=logf, cancel_callback=self.should_stop)
             logf("[*] 2. 创建邮箱并提交")
             email, dev_token = fill_email_and_submit(log_callback=logf, cancel_callback=self.should_stop)
+            if email:
+                self._trace_call("bind_identity", email)
             logf(f"[*] 邮箱: {email}")
             if get_email_provider() not in ("hotmail", "outlook", "outlookmail", "microsoft"):
                 try:
@@ -4824,6 +4868,7 @@ class GrokRegisterGUI:
             cancel_callback=self.should_stop,
         )
         result_record["cpa"] = cpa_result
+        self._trace_call("record_health", cpa_result)
         if self.should_stop():
             try:
                 mark_error(email, password, reason="cancelled")
@@ -4870,7 +4915,11 @@ class GrokRegisterGUI:
 
     def _worker_loop(self, worker_id, total, task_queue):
         prefix = f"[T{worker_id}]"
-        logf = lambda m: self.log(f"{prefix} {m}")
+
+        def logf(message):
+            self.log(f"{prefix} {message}")
+            self._trace_call("log", str(message))
+
         try:
             while not self.should_stop_scheduling():
                 try:
@@ -4882,15 +4931,35 @@ class GrokRegisterGUI:
                 idx = int(task.get("idx") or 0)
                 slot = int(task.get("slot") or idx)
                 replacement = int(task.get("replacement", 0) or 0)
+                behavior_trace = getattr(self, "behavior_trace", None)
+                if behavior_trace is not None:
+                    self._trace_call(
+                        "begin_attempt",
+                        worker_id=worker_id,
+                        idx=idx,
+                        slot=slot,
+                        replacement=replacement,
+                    )
+                outcome = "failed"
+                outcome_error = ""
                 logf(f"--- 开始第 {idx}/{total} 个账号 ---")
                 try:
                     start_browser(log_callback=logf)
                     logf("[*] 浏览器已启动")
                     self._run_single_registration(idx, total, logf)
-                except RegistrationCancelled:
+                    outcome = "accepted"
+                except RegistrationCancelled as exc:
+                    outcome = "cancelled"
+                    outcome_error = str(exc)
                     logf("[!] 注册被用户停止")
                     break
                 except (PermissionDeniedRegistration, ActivationFailedRegistration) as rejection:
+                    outcome = (
+                        "permission_denied"
+                        if isinstance(rejection, PermissionDeniedRegistration)
+                        else "activation_failed"
+                    )
+                    outcome_error = str(rejection)
                     raw_limit = config.get("registration_health_max_replacements_per_slot", 3)
                     max_replacements = max(0, int(3 if raw_limit is None else raw_limit))
                     if replacement < max_replacements and not self.should_stop_scheduling():
@@ -4913,15 +4982,25 @@ class GrokRegisterGUI:
                             self.fail_count += 1
                         logf(f"[health] 槽位 {slot} 已达到最大补号次数")
                 except CustomMailCapacityExhausted as exc:
+                    outcome = "capacity_exhausted"
+                    outcome_error = str(exc)
                     self.mail_capacity_exhausted = True
                     logf(f"[!] {exc}；停止派发剩余注册任务")
                     break
                 except Exception as exc:
+                    outcome = "failed"
+                    outcome_error = str(exc)
                     with self.stats_lock:
                         self.fail_count += 1
                     logf(f"[-] 注册失败: {exc}")
                 finally:
                     stop_browser()
+                    if behavior_trace is not None:
+                        self._trace_call(
+                            "finish_attempt",
+                            outcome,
+                            error=outcome_error,
+                        )
                     self.update_stats()
                 if self.should_stop_scheduling():
                     break
@@ -4957,6 +5036,17 @@ class GrokRegisterGUI:
                 t.join()
         finally:
             shutdown_browser()
+            trace = getattr(self, "behavior_trace", None)
+            self.behavior_trace = None
+            TabPool.set_lifecycle_observer(None)
+            set_active_batch(None)
+            if trace is not None:
+                try:
+                    report_path, summary_path = trace.finalize()
+                    self.log(f"[trace] 批次行为报告: {report_path}")
+                    self.log(f"[trace] 批次结构化摘要: {summary_path}")
+                except Exception as exc:
+                    self.log(f"[!] 自动行为追踪报告生成失败，记录目录已保留: {trace.session_dir} ({exc})")
             self._set_running_ui(False)
             self.log("[*] 任务结束")
 

@@ -64,6 +64,23 @@ class RedactionTests(unittest.TestCase):
         self.assertNotIn("ABC-123", serialized)
         self.assertNotIn("shortSecretToken12345", serialized)
 
+    def test_url_redaction_is_idempotent_for_redacted_host_placeholder(self):
+        value = "https://<redacted:secret>/data?v=%3Credacted%3E"
+
+        first = trace.redact_url(value)
+        second = trace.redact_url(first)
+
+        self.assertEqual(first, second)
+        self.assertEqual(first, value)
+
+    def test_url_redaction_masks_invalid_port_without_raising(self):
+        safe = trace.redact_url("https://example.com:secret/private?token=raw")
+
+        self.assertTrue(safe.startswith("https://<redacted:host>/"))
+        self.assertNotIn("example.com", safe)
+        self.assertNotIn("secret", safe.replace("<redacted:host>", ""))
+        self.assertNotIn("raw", safe)
+
     def test_free_text_redacts_verification_codes(self):
         self.assertNotIn("123456", trace.redact_text("aria-label=123456"))
 

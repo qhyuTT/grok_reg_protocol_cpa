@@ -92,15 +92,28 @@ def redact_url(url: str) -> str:
     try:
         parsed = urlsplit(url)
     except (TypeError, ValueError):
-        return redact_text(str(url))
+        return _redact_plain_text(str(url))
     if not parsed.scheme or not parsed.netloc:
         return redact_text(str(url))
     query = urlencode([(key, "<redacted>") for key, _value in parse_qsl(parsed.query, keep_blank_values=True)])
     fragment = "<redacted>" if parsed.fragment else ""
-    hostname = parsed.hostname or ""
-    safe_netloc = hostname
-    if parsed.port:
-        safe_netloc = f"{hostname}:{parsed.port}"
+    raw_netloc = parsed.netloc
+    if raw_netloc.startswith("<redacted:") and raw_netloc.endswith(">"):
+        safe_netloc = raw_netloc
+    else:
+        try:
+            hostname = parsed.hostname or ""
+            port = parsed.port
+        except ValueError:
+            # A malformed raw URL or an already-redacted placeholder must not
+            # turn report generation into a business-flow failure.
+            safe_netloc = "<redacted:host>"
+        else:
+            if "<redacted:" in raw_netloc:
+                safe_netloc = "<redacted:host>"
+            else:
+                safe_host = f"[{hostname}]" if ":" in hostname and not hostname.startswith("[") else hostname
+                safe_netloc = f"{safe_host}:{port}" if port else safe_host
     segments = []
     previous = ""
     for raw_segment in parsed.path.split("/"):

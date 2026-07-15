@@ -252,11 +252,23 @@ def create_standalone_page(
     except BaseException:  # noqa: BLE001
         close_owned_browser(browser)
         raise
+    try:
+        from automatic_registration_trace import attach_active_browser
+
+        attach_active_browser(browser, page, phase="cpa_consent")
+    except Exception:
+        pass
     log("standalone chromium started")
     return browser, page
 
 
 def close_standalone(browser: Any) -> None:
+    try:
+        from automatic_registration_trace import release_active_browser
+
+        release_active_browser(browser)
+    except Exception:
+        pass
     close_owned_browser(browser)
 
 
@@ -475,6 +487,12 @@ def acquire_mint_browser(
             page = st.get("page")
             browser = st.get("browser")
             clear_page_session(page, browser, log=log)
+            try:
+                from automatic_registration_trace import attach_active_browser
+
+                attach_active_browser(browser, page, phase="cpa_consent")
+            except Exception:
+                pass
             log(f"mint browser reused served={st.get('served')}")
             return browser, page, False
         log("mint browser recycle (proxy/headless/served threshold)")

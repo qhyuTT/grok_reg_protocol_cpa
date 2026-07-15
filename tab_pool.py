@@ -34,6 +34,7 @@ class TabPool:
     _accept_new = True
     _permanent_block = False
     _failed_closes: set[int] = set()
+    _lifecycle_observer: Any = None
 
     # ── public ──
 
@@ -48,6 +49,32 @@ class TabPool:
                 cls._options_factory = lambda: browser_options_or_factory
         if log_callback:
             log_callback("[*] TabPool 已初始化浏览器选项模板")
+
+    @classmethod
+    def set_lifecycle_observer(cls, observer: Any = None) -> None:
+        """Install an optional browser observer used by diagnostic tracing."""
+        with cls._lifecycle_lock:
+            cls._lifecycle_observer = observer
+
+    @classmethod
+    def _notify_browser_ready(cls, browser: Any, tab: Any) -> None:
+        observer = cls._lifecycle_observer
+        if observer is None:
+            return
+        try:
+            observer.browser_ready(browser, tab)
+        except Exception:
+            pass
+
+    @classmethod
+    def _notify_browser_releasing(cls, browser: Any, tab: Any) -> None:
+        observer = cls._lifecycle_observer
+        if observer is None:
+            return
+        try:
+            observer.browser_releasing(browser, tab)
+        except Exception:
+            pass
 
     @classmethod
     def _create_browser(cls):
@@ -104,6 +131,9 @@ class TabPool:
         """Return current thread tab; create Chromium on first use."""
         tab = getattr(cls._thread_local, "tab", None)
         if tab is not None:
+            browser = getattr(cls._thread_local, "browser", None)
+            if browser is not None:
+                cls._notify_browser_ready(browser, tab)
             return tab
         stale_browser = getattr(cls._thread_local, "browser", None)
         if stale_browser is not None and not cls.release_tab():
@@ -124,6 +154,7 @@ class TabPool:
             else:
                 tab = browser.new_tab()
             cls._thread_local.tab = tab
+            cls._notify_browser_ready(browser, tab)
             return tab
         except BaseException:  # noqa: BLE001
             cls.release_tab()
@@ -235,8 +266,10 @@ class TabPool:
         """Quit current thread Chromium and unregister it when confirmed closed."""
         with cls._lifecycle_lock:
             browser = getattr(cls._thread_local, "browser", None)
+            tab = getattr(cls._thread_local, "tab", None)
             closed = True
             if browser is not None and cls._is_registered(browser):
+                cls._notify_browser_releasing(browser, tab)
                 closed = close_owned_browser(browser)
                 if closed:
                     cls._failed_closes.discard(id(browser))
