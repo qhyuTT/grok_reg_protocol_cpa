@@ -6,7 +6,7 @@ Grok 账号批量注册工具，支持 GUI 和命令行运行。
 
 ## 主要功能
 
-- 支持 Hotmail / Outlook、CustomMail 及项目已有邮箱通道
+- 支持 Hotmail / Outlook、CustomMail、Mailnest-迈巢 及项目已有邮箱通道
 - 支持单个或批量注册，可断点续跑
 - 注册后自动完成 Grok Web 首次激活
 - 自动检查账号是否可用
@@ -86,6 +86,20 @@ cp custom_mail_credentials.example.txt custom_mail_credentials.txt
   "email_provider": "custommail"
 }
 ```
+
+### 迈巢 MailNest 临时邮箱
+
+`Outlook`邮箱提供商 [迈巢](https://mailnest.top/)，其临时邮箱采用项目制模式，因此除了在配置文件中配置`api-key`，还需配置项目代码`mailnest_project_code`，项目代码默认为`x-ai001`：
+
+```json
+{
+      "mailnest_api_key": "",
+      "mailnest_project_code": "x-ai001"
+}
+```
+
+- `api-key`获取页面：https://mailnest.top/account
+- 项目代码`mailnest_project_code`获取页面：https://mailnest.top/buy-email。默认为`x-ai001`，可以直接使用
 
 ## 运行
 
