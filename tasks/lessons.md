@@ -10,6 +10,6 @@
 - 备用接口成功只应把权限类 402/403 标记为端点不一致，不能覆盖主接口已经确认的 quota 或 reauth 分类。
 - 自动化浏览器追踪不能在后台线程对注册标签循环执行 `Runtime.evaluate`；这会与主流程争用同一 CDP 通道并造成页面超时。应优先消费浏览器主动回调，只有首次挂载时安装事件脚本。
 - 指纹/UA 改造前必须先确认目标代码在活跃调用链上：`enable_nsfw`/`enable_nsfw_for_token`（含其 `get_user_agent()` Windows UA、`impersonate=chrome120`、cf_clearance 复用）都没有调用点，是死代码；真实生日/TOS 在浏览器内 `activate_grok_web_account` 由真实系统 Chrome 完成，UA 天然正确。不要为“完成计划”去改不影响运行的死代码。
-- 成功与 permission_denied 的注册在浏览器行为上无法区分（相同步骤/端点，注册期请求全 200）；403 是注册直后风控冷却的普遍态，健康账号约 15s 内转 200，被拒账号持续 403。差异在服务端风控（IP/指纹/节奏/冷却），不在客户端操作序列。健康探测 offset 到 120s 无意义。
+- 成功与 permission_denied 的注册在浏览器行为上无法区分（相同步骤/端点，注册期请求全 200）；历史健康审计 44/44 在 offset 0 先返回 403，41 条在 15s 恢复、3 条需等到 45s。新 token 默认应避开即时探测并使用 10/20/45 多时间点确认；被拒账号持续 403，offset 到 120s 无意义。
 - 真实指纹自曝点在活跃路径上：`--disable-gpu`/`--disable-software-rasterizer` 让有头 Chrome 的 WebGL 退化为 SwiftShader 软件渲染；`turnstilePatch` 伪造 `navigator.plugins=[1,2,3,4,5]` 使 `plugins[0].name===undefined`。二者都比不改更假，有头真实系统 Chrome 下应移除。
 - 调用 GUI/CLI worker 的单元测试必须显式关闭 rotation 或注入临时 state/history/lock 路径；不能继承本机 `config.json`，否则测试可能切换真实 Clash 节点并污染运行时冷却状态。

@@ -129,7 +129,7 @@ def mint_and_export(
     auth_code_require_referrer: bool = True,
     required_referrer: str | None = None,
     health_check: bool = False,
-    health_probe_delays: list[float] | tuple[float, ...] = (0,),
+    health_probe_delays: list[float] | tuple[float, ...] = (10, 20, 45),
     health_reject_inconclusive: bool = True,
     write_auth: bool = True,
     log: LogFn | None = None,
@@ -348,15 +348,24 @@ def mint_and_export(
     if health_check:
         from .inspection import aggregate_health_attempts, inspect_access_token
 
-        delays = sorted({max(0.0, float(value)) for value in (health_probe_delays or (0,))})
+        delays = sorted(
+            {
+                max(0.0, float(value))
+                for value in (health_probe_delays or (10, 20, 45))
+            }
+        )
         if not delays:
-            delays = [0.0]
+            delays = [10.0, 20.0, 45.0]
         health_started = time.monotonic()
         attempts: list[dict[str, Any]] = []
+        token_iat = result["token_metadata"].get("iat")
         for attempt_index, offset in enumerate(delays, 1):
             remaining = offset - (time.monotonic() - health_started)
             if remaining > 0 and not _wait_with_cancel(remaining, cancel):
                 return {**result, "ok": False, "error": "cancelled"}
+            token_age_sec = None
+            if isinstance(token_iat, (int, float)):
+                token_age_sec = round(max(0.0, time.time() - float(token_iat)), 3)
             try:
                 attempt = inspect_access_token(
                     tokens["access_token"],
@@ -372,13 +381,17 @@ def mint_and_export(
                 }
             attempt["attempt"] = attempt_index
             attempt["offset_sec"] = offset
+            if token_age_sec is not None:
+                attempt["token_age_sec"] = token_age_sec
             attempts.append(attempt)
             log(
-                "health attempt=%s/%s classification=%s confidence=%s "
+                "health attempt=%s/%s offset=%ss token_age=%s classification=%s confidence=%s "
                 "status=%s code=%s fallback=%s error=%s"
                 % (
                     attempt_index,
                     len(delays),
+                    offset,
+                    f"{token_age_sec:.3f}s" if token_age_sec is not None else "?",
                     attempt.get("classification"),
                     attempt.get("confidence"),
                     attempt.get("http_status"),

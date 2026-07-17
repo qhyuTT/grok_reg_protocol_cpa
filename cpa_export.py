@@ -29,14 +29,14 @@ def _parse_health_delays(value: Any) -> list[float]:
     elif isinstance(value, (list, tuple)):
         values = list(value)
     else:
-        values = [0, 15, 45]
+        values = [10, 20, 45]
     parsed = []
     for item in values:
         try:
             parsed.append(max(0.0, float(item)))
         except (TypeError, ValueError):
             continue
-    return sorted(set(parsed)) or [0.0, 15.0, 45.0]
+    return sorted(set(parsed)) or [10.0, 20.0, 45.0]
 
 
 def _redact_audit_text(value: Any, limit: int = 500) -> str:
@@ -65,6 +65,7 @@ def _health_attempt_for_audit(item: dict[str, Any]) -> dict[str, Any]:
     return {
         "attempt": item.get("attempt"),
         "offset_sec": item.get("offset_sec"),
+        "token_age_sec": item.get("token_age_sec"),
         "classification": item.get("classification"),
         "confidence": item.get("confidence"),
         "model": item.get("model"),
@@ -267,7 +268,7 @@ def export_cpa_xai_for_account(
         # the pipeline-wide policy when the new key is absent.
         required_referrer = "grok-build" if auth_code_require_referrer else ""
     health_probe_delays = _parse_health_delays(
-        cfg.get("registration_health_probe_delays_sec", [0, 15, 45])
+        cfg.get("registration_health_probe_delays_sec", [10, 20, 45])
     )
     health_reject_inconclusive = bool(
         cfg.get("registration_health_reject_inconclusive", True)

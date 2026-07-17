@@ -173,7 +173,7 @@ def main() -> int:
     health_on = bool(cfg.get("registration_health_check_enabled", False))
     print(f"proxy={proxy or '(none)'}", flush=True)
     print(
-        f"health_check={health_on} delays={cfg.get('registration_health_probe_delays_sec', [0, 15, 45])}",
+        f"health_check={health_on} delays={cfg.get('registration_health_probe_delays_sec', [10, 20, 45])}",
         flush=True,
     )
 

@@ -58,7 +58,7 @@ DEFAULT_CONFIG = {
     "cpa_gui_close_mint_browser": True,
     "registration_health_check_enabled": True,
     "registration_health_max_replacements_per_slot": 3,
-    "registration_health_probe_delays_sec": [0, 15, 45],
+    "registration_health_probe_delays_sec": [10, 20, 45],
     "registration_health_reject_inconclusive": True,
     "registration_health_audit_file": "cpa_auths/registration_health_audit.jsonl",
     "registration_post_activation_settle_sec": 5,

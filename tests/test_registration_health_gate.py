@@ -1,16 +1,22 @@
 from __future__ import annotations
 
+import base64
 import json
 import tempfile
 import queue
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 import cpa_xai
 import cpa_xai.mint as mint_module
 import cpa_export
 import register_cli
+
+
+def _jwt(payload: dict[str, object]) -> str:
+    encoded = base64.urlsafe_b64encode(json.dumps(payload).encode()).rstrip(b"=").decode()
+    return f"header.{encoded}.signature"
 
 
 class MintHealthGateTests(unittest.TestCase):
@@ -74,6 +80,7 @@ class MintHealthGateTests(unittest.TestCase):
                 sso="sso-cookie",
                 prefer_auth_code=False,
                 health_check=True,
+                health_probe_delays=(0,),
                 probe=False,
             )
 
@@ -105,7 +112,163 @@ class MintHealthGateTests(unittest.TestCase):
         self.assertEqual(kwargs["auth_code_timeout_sec"], 90.0)
         self.assertTrue(kwargs["auth_code_require_referrer"])
         self.assertEqual(kwargs["required_referrer"], "grok-build")
-        self.assertEqual(kwargs["health_probe_delays"], [0.0, 15.0, 45.0])
+        self.assertEqual(kwargs["health_probe_delays"], [10.0, 20.0, 45.0])
+        self.assertEqual(
+            register_cli.reg.DEFAULT_CONFIG["registration_health_probe_delays_sec"],
+            [10, 20, 45],
+        )
+
+    def test_health_delay_parser_defaults_and_preserves_explicit_legacy_offsets(self):
+        self.assertEqual(cpa_export._parse_health_delays(None), [10.0, 20.0, 45.0])
+        self.assertEqual(cpa_export._parse_health_delays([]), [10.0, 20.0, 45.0])
+        self.assertEqual(
+            cpa_export._parse_health_delays([0, 15, 45]),
+            [0.0, 15.0, 45.0],
+        )
+
+    def test_default_schedule_waits_until_ten_seconds_and_records_token_age(self):
+        token = {
+            "access_token": _jwt({"iat": 1000, "referrer": "grok-build"}),
+            "refresh_token": "refresh-token",
+            "expires_in": 3600,
+            "mint_method": "protocol",
+        }
+        logs: list[str] = []
+        with (
+            patch.object(mint_module, "mint_with_sso_protocol", return_value=token),
+            patch.object(mint_module, "_wait_with_cancel", return_value=True) as wait,
+            patch.object(mint_module.time, "monotonic", side_effect=[0.0, 0.0]),
+            patch.object(mint_module.time, "time", return_value=1012.5),
+            patch(
+                "cpa_xai.inspection.inspect_access_token",
+                return_value={"classification": "healthy", "confidence": "confirmed"},
+            ) as inspect,
+        ):
+            result = cpa_xai.mint_and_export(
+                email="schedule@example.com",
+                password="secret",
+                auth_dir="unused",
+                sso="sso-cookie",
+                prefer_auth_code=False,
+                health_check=True,
+                write_auth=False,
+                probe=False,
+                log=logs.append,
+            )
+
+        self.assertTrue(result["ok"])
+        wait.assert_called_once_with(10.0, None)
+        inspect.assert_called_once()
+        attempt = result["health"]["attempts"][0]
+        self.assertEqual(attempt["offset_sec"], 10.0)
+        self.assertEqual(attempt["token_age_sec"], 12.5)
+        self.assertTrue(any("offset=10.0s token_age=12.500s" in row for row in logs))
+
+    def test_default_schedule_uses_absolute_ten_twenty_forty_five_offsets(self):
+        denied = {
+            "classification": "permission_denied",
+            "confidence": "confirmed",
+            "http_status": 403,
+            "error_code": "permission-denied",
+        }
+        with (
+            patch.object(mint_module, "mint_with_sso_protocol", return_value=self._mint_tokens()),
+            patch.object(mint_module, "_wait_with_cancel", return_value=True) as wait,
+            patch.object(
+                mint_module.time,
+                "monotonic",
+                side_effect=[0.0, 0.0, 10.0, 20.0],
+            ),
+            patch(
+                "cpa_xai.inspection.inspect_access_token",
+                side_effect=[dict(denied) for _ in range(3)],
+            ) as inspect,
+        ):
+            result = cpa_xai.mint_and_export(
+                email="persistent-denied@example.com",
+                password="secret",
+                auth_dir="unused",
+                sso="sso-cookie",
+                prefer_auth_code=False,
+                health_check=True,
+                write_auth=False,
+                probe=False,
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["rejected"])
+        self.assertEqual(
+            wait.call_args_list,
+            [call(10.0, None), call(10.0, None), call(25.0, None)],
+        )
+        self.assertEqual(inspect.call_count, 3)
+        self.assertEqual(
+            [row["offset_sec"] for row in result["health"]["attempts"]],
+            [10.0, 20.0, 45.0],
+        )
+
+    def test_default_schedule_stops_after_twenty_or_forty_five_second_success(self):
+        denied = {
+            "classification": "permission_denied",
+            "confidence": "confirmed",
+            "http_status": 403,
+            "error_code": "permission-denied",
+        }
+        healthy = {"classification": "healthy", "confidence": "confirmed"}
+        scenarios = (
+            (
+                "healthy_at_twenty",
+                [dict(denied), dict(healthy)],
+                [0.0, 0.0, 10.0],
+                [call(10.0, None), call(10.0, None)],
+                [10.0, 20.0],
+            ),
+            (
+                "healthy_at_forty_five",
+                [dict(denied), dict(denied), dict(healthy)],
+                [0.0, 0.0, 10.0, 20.0],
+                [call(10.0, None), call(10.0, None), call(25.0, None)],
+                [10.0, 20.0, 45.0],
+            ),
+        )
+        for name, health_rows, monotonic_values, waits, offsets in scenarios:
+            with self.subTest(name=name):
+                with (
+                    patch.object(
+                        mint_module,
+                        "mint_with_sso_protocol",
+                        return_value=self._mint_tokens(),
+                    ),
+                    patch.object(
+                        mint_module, "_wait_with_cancel", return_value=True
+                    ) as wait,
+                    patch.object(
+                        mint_module.time,
+                        "monotonic",
+                        side_effect=monotonic_values,
+                    ),
+                    patch(
+                        "cpa_xai.inspection.inspect_access_token",
+                        side_effect=health_rows,
+                    ),
+                ):
+                    result = cpa_xai.mint_and_export(
+                        email=f"{name}@example.com",
+                        password="secret",
+                        auth_dir="unused",
+                        sso="sso-cookie",
+                        prefer_auth_code=False,
+                        health_check=True,
+                        write_auth=False,
+                        probe=False,
+                    )
+
+                self.assertTrue(result["ok"])
+                self.assertEqual(wait.call_args_list, waits)
+                self.assertEqual(
+                    [row["offset_sec"] for row in result["health"]["attempts"]],
+                    offsets,
+                )
 
     def test_invalid_protocol_referrer_falls_back_to_browser_before_health(self):
         browser_tokens = {
@@ -138,6 +301,7 @@ class MintHealthGateTests(unittest.TestCase):
                 sso="sso-cookie",
                 prefer_auth_code=False,
                 health_check=True,
+                health_probe_delays=(0,),
                 probe=False,
             )
 
@@ -245,6 +409,7 @@ class MintHealthGateTests(unittest.TestCase):
                 prefer_auth_code=False,
                 auth_code_require_referrer=False,
                 health_check=True,
+                health_probe_delays=(0,),
                 probe=False,
             )
 
@@ -396,6 +561,7 @@ class HealthAuditTests(unittest.TestCase):
                         {
                             "attempt": 1,
                             "offset_sec": 0,
+                            "token_age_sec": 12.5,
                             "classification": "forbidden_unknown",
                             "http_status": 403,
                             "responses_raw_snippet": (
@@ -417,6 +583,7 @@ class HealthAuditTests(unittest.TestCase):
             raw = record["attempts"][0]["responses_raw_snippet"]
             self.assertNotIn("user@example.com", raw)
             self.assertNotIn("eyJaaaaaaaa", raw)
+            self.assertEqual(record["attempts"][0]["token_age_sec"], 12.5)
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
 
     def test_health_audit_redacts_long_token_before_truncation(self):
