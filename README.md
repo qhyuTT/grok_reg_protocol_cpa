@@ -1,10 +1,24 @@
-# grok_reg-protocol_cpa
+<div align="center">
 
-Grok 账号批量注册工具，支持 GUI 和命令行运行。
+# Grok Registration Protocol CPA
 
-注册完成后会自动完成首次激活、账号可用性检查，并按配置导出账号与 CPA 认证文件。不可用账号不会写入结果，可在有限任务中自动补号。
+**支持 GUI 与命令行的 Grok 账号批量注册及 CPA 认证导出工具**
 
-## 主要功能
+[![Python](https://img.shields.io/badge/Python-3.13-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![uv](https://img.shields.io/badge/Package%20Manager-uv-DE5FE9)](https://docs.astral.sh/uv/)
+![Platform](https://img.shields.io/badge/Platform-macOS%20%7C%20Linux-lightgrey)
+![Interface](https://img.shields.io/badge/Interface-GUI%20%7C%20CLI-0A7BBC)
+
+[主要功能](#-主要功能) · [快速开始](#-快速开始) · [运行方式](#-运行方式) · [常见问题](#-常见问题) · [加入交流群](https://t.me/+VWfAKGZZGyw3NDA1)
+
+</div>
+
+> [!TIP]
+> 💬 感兴趣的朋友欢迎加入 [Telegram 交流群](https://t.me/+VWfAKGZZGyw3NDA1)，一起交流、折腾和完善项目。
+
+注册完成后，工具会自动完成 Grok Web 首次激活、账号可用性检查，并按配置导出账号与 CPA 认证文件。不可用账号不会写入结果；在有限任务中，工具可以自动补号。
+
+## ✨ 主要功能
 
 - 支持 Hotmail / Outlook、CustomMail 及项目已有邮箱通道
 - 支持单个或批量注册，可断点续跑
@@ -13,7 +27,17 @@ Grok 账号批量注册工具，支持 GUI 和命令行运行。
 - 可导出 CPA 认证文件
 - 本地和远程 grok2api 自动入池默认关闭
 
-## 环境要求
+## 📊 运行效果
+
+下面是一次实际运行的结果示例：成功 7 个、注册失败 0 个、权限拒绝 0 个，Web 激活失败 1 个。
+
+<p align="center">
+  <img src="docs/assets/registration-success.png" alt="Grok 批量注册运行成功统计" width="100%">
+</p>
+
+> 实际成功率会受到邮箱质量、代理网络、风控策略及运行环境等因素影响。
+
+## 🧰 环境要求
 
 - macOS 或带桌面环境的 Linux
 - Python 3.13
@@ -21,7 +45,7 @@ Grok 账号批量注册工具，支持 GUI 和命令行运行。
 - Google Chrome 或 Chromium
 - 可访问 xAI 服务的代理
 
-## 快速开始
+## 🚀 快速开始
 
 安装依赖：
 
@@ -87,7 +111,7 @@ cp custom_mail_credentials.example.txt custom_mail_credentials.txt
 }
 ```
 
-## 运行
+## ▶️ 运行方式
 
 命令行注册 1 个账号：
 
@@ -113,7 +137,7 @@ uv run python grok_register_ttk.py
 uv run python register_cli.py --help
 ```
 
-## 输出文件
+## 📦 输出文件
 
 | 文件 | 内容 |
 |---|---|
@@ -128,7 +152,7 @@ uv run python register_cli.py --help
 email----password----sso
 ```
 
-## 常用配置
+## ⚙️ 常用配置
 
 | 配置项 | 说明 |
 |---|---|
@@ -145,7 +169,7 @@ email----password----sso
 
 其余选项直接查看 [`config.example.json`](config.example.json) 中的注释。
 
-## 常见问题
+## ❓ 常见问题
 
 - 收不到验证码：检查邮箱凭证、转发规则和代理。
 - 浏览器无法启动：确认 Chrome / Chromium 已安装，并关闭冲突的调试进程。
@@ -154,14 +178,15 @@ email----password----sso
 - 注册成功但没有 CPA 文件：检查 `cpa_export_enabled` 和运行日志。
 - rotation 开启后批次主动停止：检查 controller、代理端口、美国地区探测和通用 403 熔断日志；系统会 fail-closed，避免静默复用被拒出口。
 
-更多说明：
+### 相关文档
 
 - [启动说明](STARTUP.md)
 - [CustomMail CLI 指南](CUSTOMMAIL_CLI.md)
 - [CPA 隔离诊断](DIAGNOSTIC_CLI_PROXY.md)
 
-## 安全提醒
+## 🔒 安全提醒
 
-`config.json`、邮箱凭证、账号文件、Cookie、Token 和运行记录均包含敏感信息。相关文件已加入 `.gitignore`，请勿手动提交或分享。
+> [!WARNING]
+> `config.json`、邮箱凭证、账号文件、Cookie、Token 和运行记录均包含敏感信息。相关文件已加入 `.gitignore`，请勿手动提交或分享。
 
 请在遵守相关服务条款和当地法律的前提下使用本项目。
