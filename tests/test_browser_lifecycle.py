@@ -327,6 +327,7 @@ class BrowserDefaultTests(unittest.TestCase):
         task_queue.put(1)
 
         with (
+            patch.dict(reg.config, {"proxy_rotation_enabled": False}, clear=False),
             patch.object(reg, "start_browser") as start_browser,
             patch.object(reg, "stop_browser") as stop_browser,
             patch.object(reg, "restart_browser") as restart_browser,
@@ -346,7 +347,7 @@ class BrowserDefaultTests(unittest.TestCase):
                     mint_module,
                     "mint_with_sso_protocol",
                     side_effect=mint_module.ProtocolMintError("cancelled"),
-                ),
+                ) as protocol_mint,
                 patch.object(mint_module, "mint_with_browser") as browser_mint,
             ):
                 result = mint_module.mint_and_export(
@@ -354,11 +355,13 @@ class BrowserDefaultTests(unittest.TestCase):
                     password="password",
                     auth_dir=auth_dir,
                     sso="sso-cookie",
+                    prefer_auth_code=False,
                     probe=False,
                     cancel=lambda: True,
                 )
 
         self.assertEqual(result["error"], "cancelled")
+        protocol_mint.assert_called_once()
         browser_mint.assert_not_called()
 
 

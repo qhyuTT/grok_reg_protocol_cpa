@@ -82,6 +82,42 @@ DEFAULT_CONFIG = {
     "custom_mail_recent_seconds": 900,
     "custom_mail_imap_last_n": 50,
     "custom_mail_allowed_sender_domains": "x.ai,grok.com",
+    # Clash US egress rotation (see proxy_rotation.py)
+    "proxy_rotation_enabled": False,
+    "proxy_rotation_controller_url": "http://127.0.0.1:9090",
+    "proxy_rotation_controller_secret": "",
+    "proxy_rotation_proxy_group": "飞鸟云",
+    "proxy_rotation_node_filter": "(?i)美国",
+    "proxy_rotation_node_exclude": (
+        "(?i)自动选择|故障转移|剩余流量|套餐到期|更新订阅|有超过20|客户端设置|电报|防失联|"
+        "新加坡|日本|台湾|hy2台湾"
+    ),
+    "proxy_rotation_gateway": "",
+    "proxy_rotation_allowed_countries": ["US"],
+    "proxy_rotation_require_us": True,
+    "proxy_rotation_ip_probe_urls": [
+        "https://ipinfo.io/json",
+        "https://api.ipify.org?format=json",
+    ],
+    "proxy_rotation_switch_settle_sec": 1.5,
+    "proxy_rotation_switch_confirm_timeout_sec": 5,
+    "proxy_rotation_switch_confirm_interval_sec": 0.2,
+    "proxy_rotation_controller_timeout_sec": 5,
+    "proxy_rotation_probe_timeout_sec": 10,
+    "proxy_rotation_max_switch_attempts": 8,
+    "proxy_rotation_max_wait_sec": 600,
+    "proxy_rotation_cooldown_healthy_sec": 360,
+    "proxy_rotation_cooldown_denied_sec": 900,
+    "proxy_rotation_cooldown_soft_sec": 180,
+    "proxy_rotation_cooldown_forbidden_unknown_sec": 180,
+    "proxy_rotation_cooldown_fail_sec": 60,
+    "proxy_rotation_cooldown_activation_failed_sec": 120,
+    "proxy_rotation_cooldown_egress_denied_sec": 1800,
+    "proxy_rotation_egress_denied_breaker_threshold": 2,
+    "proxy_rotation_bad_geo_cooldown_sec": 3600,
+    "proxy_rotation_state_file": "cpa_auths/proxy_egress_state.json",
+    "proxy_rotation_lock_file": "cpa_auths/proxy_rotation.lock",
+    "proxy_rotation_history_file": "cpa_auths/proxy_egress_history.jsonl",
 }
 
 config = DEFAULT_CONFIG.copy()
@@ -1392,6 +1428,36 @@ def _config_bool(value, default=False):
         if v in ("0", "false", "no", "n", "off"):
             return False
     return default
+
+
+def _prepare_rotation_manager(rotation_config, log_callback=None):
+    """Validate rotation before a GUI batch can consume its first mailbox."""
+    if not _config_bool((rotation_config or {}).get("proxy_rotation_enabled"), False):
+        return None
+    import proxy_rotation as proxy_rot
+
+    validator = getattr(proxy_rot, "validate_rotation_config", None)
+    if callable(validator):
+        validator(rotation_config)
+    manager = proxy_rot.get_manager(rotation_config, log=log_callback)
+    reset_breaker = getattr(manager, "reset_batch_breaker", None)
+    if callable(reset_breaker):
+        reset_breaker()
+    return manager
+
+
+def _rotation_should_stop_batch(manager):
+    if manager is None:
+        return False
+    for name in ("should_stop_batch", "batch_breaker_tripped"):
+        checker = getattr(manager, name, None)
+        if callable(checker):
+            try:
+                if checker():
+                    return True
+            except Exception:
+                continue
+    return False
 
 
 def _resolve_project_path(path_value, default_name="mail_credentials.txt"):
@@ -4045,10 +4111,20 @@ def export_cpa_after_success(
         log(f"[cpa] 已导出 cookie {len(cookies)} 条供 OIDC mint 注入")
 
     cpa_cfg = dict(config)
-    if _config_bool(config.get("cpa_gui_close_mint_browser", True), default=True):
+    if _config_bool(config.get("proxy_rotation_enabled"), default=False) or _config_bool(
+        config.get("cpa_gui_close_mint_browser", True), default=True
+    ):
         # GUI 下优先不残留额外 Chromium：CPA mint 成功后也立即 quit。
-        # CLI 仍可通过 cpa_mint_browser_reuse 保持流水线复用。
+        # Rotation additionally requires a fresh CPA browser for each lease.
         cpa_cfg["cpa_mint_browser_reuse"] = False
+    try:
+        import proxy_rotation as _proxy_rot
+
+        egress_meta = _proxy_rot.get_manager(config).current_lease_metadata()
+        if egress_meta:
+            cpa_cfg["_egress"] = egress_meta
+    except Exception:
+        pass
 
     # GUI 可多线程注册；CPA mint 使用独立有头浏览器，串行可避免多个 consent 窗口互相抢焦点。
     with _cpa_gui_export_lock:
@@ -4568,7 +4644,11 @@ class GrokRegisterGUI:
         return self.stop_requested or not self.is_running
 
     def should_stop_scheduling(self):
-        return self.should_stop() or bool(getattr(self, "mail_capacity_exhausted", False))
+        return (
+            self.should_stop()
+            or bool(getattr(self, "mail_capacity_exhausted", False))
+            or bool(getattr(self, "egress_batch_stopped", False))
+        )
 
     def start_registration(self):
         if self.is_running:
@@ -4666,6 +4746,11 @@ class GrokRegisterGUI:
         if count < 1:
             self.log("[!] 注册数量必须大于 0")
             return
+        try:
+            _prepare_rotation_manager(config, log_callback=self.log)
+        except Exception as exc:
+            self.log(f"[proxy-rot] 配置/出口校验失败，任务未启动: {exc}")
+            return
         if config["email_provider"] == "custommail":
             try:
                 capacity = get_custom_mail_capacity()
@@ -4685,6 +4770,7 @@ class GrokRegisterGUI:
                 count = remaining
         self.stop_requested = False
         self.mail_capacity_exhausted = False
+        self.egress_batch_stopped = False
         self.success_count = 0
         self.fail_count = 0
         self.health_rejected_count = 0
@@ -4890,7 +4976,9 @@ class GrokRegisterGUI:
             with self.stats_lock:
                 self.health_rejected_count += 1
             logf(f"[-] 健康门淘汰候选，不落盘并准备补号: {email} ({rejection_summary})")
-            raise PermissionDeniedRegistration(email)
+            rejection = PermissionDeniedRegistration(email)
+            rejection.mint_result = cpa_result
+            raise rejection
 
         health = cpa_result.get("health") if isinstance(cpa_result, dict) else None
         classification = health.get("classification") if isinstance(health, dict) else "unknown"
@@ -4914,6 +5002,7 @@ class GrokRegisterGUI:
             logf(f"[+] 注册成功并通过健康门: {email}")
         else:
             logf(f"[+] 注册成功，健康结果按策略保留: {email} ({classification})")
+        return result_record
 
     def _worker_loop(self, worker_id, total, task_queue):
         prefix = f"[T{worker_id}]"
@@ -4944,11 +5033,37 @@ class GrokRegisterGUI:
                     )
                 outcome = "failed"
                 outcome_error = ""
+                mint_result = None
+                replacement_rejection = None
                 logf(f"--- 开始第 {idx}/{total} 个账号 ---")
+                rot_mgr = None
+                lease = None
+                if _config_bool(config.get("proxy_rotation_enabled"), False):
+                    try:
+                        import proxy_rotation as proxy_rot
+
+                        rot_mgr = proxy_rot.get_manager(config, log=logf)
+                        lease = rot_mgr.acquire(cancel=self.should_stop)
+                    except Exception as exc:
+                        outcome_error = str(exc)
+                        self.egress_batch_stopped = True
+                        logf(f"[proxy-rot] 无法获取合格出口，批次停止: {exc}")
+                        if behavior_trace is not None:
+                            self._trace_call(
+                                "finish_attempt",
+                                outcome,
+                                error=outcome_error,
+                            )
+                        self.update_stats()
+                        break
                 try:
                     start_browser(log_callback=logf)
                     logf("[*] 浏览器已启动")
-                    self._run_single_registration(idx, total, logf)
+                    registration_result = self._run_single_registration(idx, total, logf)
+                    if isinstance(registration_result, dict):
+                        candidate_mint = registration_result.get("cpa")
+                        if isinstance(candidate_mint, dict):
+                            mint_result = candidate_mint
                     outcome = "accepted"
                 except RegistrationCancelled as exc:
                     outcome = "cancelled"
@@ -4962,6 +5077,62 @@ class GrokRegisterGUI:
                         else "activation_failed"
                     )
                     outcome_error = str(rejection)
+                    rejection_mint = getattr(rejection, "mint_result", None)
+                    if isinstance(rejection_mint, dict):
+                        mint_result = rejection_mint
+                    replacement_rejection = rejection
+                except CustomMailCapacityExhausted as exc:
+                    outcome = "capacity_exhausted"
+                    outcome_error = str(exc)
+                    self.mail_capacity_exhausted = True
+                    logf(f"[!] {exc}；停止派发剩余注册任务")
+                    break
+                except Exception as exc:
+                    outcome = "failed"
+                    outcome_error = str(exc)
+                    with self.stats_lock:
+                        self.fail_count += 1
+                    logf(f"[-] 注册失败: {exc}")
+                finally:
+                    # Keep the process-wide lease/flock until every browser that
+                    # could still use the selected mixed-port has been closed.
+                    try:
+                        stop_browser()
+                    except Exception as exc:
+                        self.egress_batch_stopped = True
+                        logf(f"[browser] 注册浏览器关闭失败: {exc}")
+                        try:
+                            shutdown_browser(block_new=True)
+                        except Exception:
+                            pass
+                    if rot_mgr is not None and lease is not None:
+                        try:
+                            from cpa_xai.browser_confirm import shutdown_mint_browsers
+
+                            shutdown_mint_browsers()
+                        except Exception:
+                            pass
+                        try:
+                            import proxy_rotation as proxy_rot
+
+                            rot_mgr.release(
+                                lease,
+                                proxy_rot.map_registration_outcome(outcome, mint_result),
+                            )
+                        except Exception as exc:
+                            self.egress_batch_stopped = True
+                            logf(f"[proxy-rot] release failed，批次停止: {exc}")
+                        if _rotation_should_stop_batch(rot_mgr):
+                            self.egress_batch_stopped = True
+                            logf("[proxy-rot] 连续出口访问拒绝已触发批次熔断；停止派发剩余任务")
+                    if behavior_trace is not None:
+                        self._trace_call(
+                            "finish_attempt",
+                            outcome,
+                            error=outcome_error,
+                        )
+                    self.update_stats()
+                if replacement_rejection is not None:
                     raw_limit = config.get("registration_health_max_replacements_per_slot", 3)
                     max_replacements = max(0, int(3 if raw_limit is None else raw_limit))
                     if replacement < max_replacements and not self.should_stop_scheduling():
@@ -4976,34 +5147,13 @@ class GrokRegisterGUI:
                             }
                         )
                         logf(
-                            f"[health] 槽位 {slot} 候选淘汰({type(rejection).__name__})，自动补注册 "
+                            f"[health] 槽位 {slot} 候选淘汰({type(replacement_rejection).__name__})，自动补注册 "
                             f"{replacement + 1}/{max_replacements}"
                         )
-                    else:
+                    elif not bool(getattr(self, "egress_batch_stopped", False)):
                         with self.stats_lock:
                             self.fail_count += 1
                         logf(f"[health] 槽位 {slot} 已达到最大补号次数")
-                except CustomMailCapacityExhausted as exc:
-                    outcome = "capacity_exhausted"
-                    outcome_error = str(exc)
-                    self.mail_capacity_exhausted = True
-                    logf(f"[!] {exc}；停止派发剩余注册任务")
-                    break
-                except Exception as exc:
-                    outcome = "failed"
-                    outcome_error = str(exc)
-                    with self.stats_lock:
-                        self.fail_count += 1
-                    logf(f"[-] 注册失败: {exc}")
-                finally:
-                    stop_browser()
-                    if behavior_trace is not None:
-                        self._trace_call(
-                            "finish_attempt",
-                            outcome,
-                            error=outcome_error,
-                        )
-                    self.update_stats()
                 if self.should_stop_scheduling():
                     break
                 if not task_queue.empty():
@@ -5018,6 +5168,23 @@ class GrokRegisterGUI:
         for i in range(1, count + 1):
             task_queue.put({"idx": i, "slot": i, "replacement": 0})
         self.next_attempt_idx = count + 1
+        # Single mixed-port Clash: force one register worker when rotation is on.
+        try:
+            import proxy_rotation as _proxy_rot
+
+            if _proxy_rot.force_serial_pipeline(config) and worker_count != 1:
+                self.log(
+                    f"[proxy-rot] rotation enabled → force worker_count=1 "
+                    f"(was {worker_count})"
+                )
+                worker_count = 1
+        except Exception as exc:
+            if _config_bool(config.get("proxy_rotation_enabled"), False):
+                self.egress_batch_stopped = True
+                worker_count = 0
+                self.log(f"[proxy-rot] worker 约束失败，批次停止: {exc}")
+            else:
+                self.log(f"[proxy-rot] worker clamp skipped: {exc}")
         workers = []
         try:
             try:

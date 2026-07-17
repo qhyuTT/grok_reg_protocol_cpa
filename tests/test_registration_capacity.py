@@ -32,7 +32,11 @@ class RegistrationCapacityTests(unittest.TestCase):
         tasks.put(1)
         tasks.put(2)
 
-        with patch.object(reg, "start_browser"), patch.object(reg, "stop_browser"):
+        with (
+            patch.dict(reg.config, {"proxy_rotation_enabled": False}, clear=False),
+            patch.object(reg, "start_browser"),
+            patch.object(reg, "stop_browser"),
+        ):
             gui._worker_loop(1, 2, tasks)
 
         self.assertTrue(gui.mail_capacity_exhausted)
@@ -47,6 +51,7 @@ class RegistrationCapacityTests(unittest.TestCase):
         exhausted = reg.CustomMailCapacityExhausted(total=2, consumed=2)
 
         with (
+            patch.dict(reg.config, {"proxy_rotation_enabled": False}, clear=False),
             patch.object(register_cli, "_ensure_browser"),
             patch.object(reg, "open_signup_page") as open_signup,
             patch.object(reg, "fill_email_and_submit", side_effect=exhausted) as fill_email,

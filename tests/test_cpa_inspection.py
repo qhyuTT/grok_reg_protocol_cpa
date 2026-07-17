@@ -9,6 +9,7 @@ from cpa_xai.inspection import (
     inspect_access_token,
     pick_model,
 )
+from cpa_xai.schema import DEFAULT_CLIENT_HEADERS
 
 
 class _Response:
@@ -178,12 +179,33 @@ class InspectionTests(unittest.TestCase):
             _Response(200, {"data": [{"id": "grok-4.5"}]}),
             _Response(200, {"output": []}),
         ])
-        inspect_access_token("token", base_url="https://test/v1", opener=opener)
+        result = inspect_access_token("token", base_url="https://test/v1", opener=opener)
         headers = {key.lower(): value for key, value in opener.requests[-1].header_items()}
-        self.assertEqual(headers["x-xai-token-auth"], "xai-grok-cli")
-        self.assertEqual(headers["x-grok-client-version"], "0.2.93")
-        self.assertEqual(headers["user-agent"], "xai-grok-workspace/0.2.93")
-        self.assertNotIn("x-grok-client-identifier", headers)
+        for key, value in DEFAULT_CLIENT_HEADERS.items():
+            self.assertEqual(headers[key.lower()], value)
+        self.assertEqual(
+            result["headers_profile"]["client_identifier"],
+            DEFAULT_CLIENT_HEADERS["x-grok-client-identifier"],
+        )
+
+    def test_all_generic_403_endpoints_are_egress_access_denied(self):
+        opener = _Opener([
+            _http_error(403, {}),
+            _http_error(403, {}),
+            _http_error(403, {}),
+        ])
+        result = inspect_access_token("token", base_url="https://test/v1", opener=opener)
+        self.assertEqual(result["classification"], "egress_access_denied")
+        self.assertEqual(result["confidence"], "inconclusive")
+
+    def test_explicit_permission_evidence_is_not_mislabeled_as_egress(self):
+        opener = _Opener([
+            _http_error(403, {}),
+            _http_error(403, {"error": {"code": "permission-denied"}}),
+            _http_error(403, {}),
+        ])
+        result = inspect_access_token("token", base_url="https://test/v1", opener=opener)
+        self.assertEqual(result["classification"], "permission_denied")
 
     def test_repeated_permission_requires_confirmed_evidence(self):
         attempts = [
@@ -250,6 +272,21 @@ class InspectionTests(unittest.TestCase):
         )
         self.assertTrue(result["reject_candidate"])
         self.assertEqual(result["classification"], "forbidden_unknown")
+
+    def test_repeated_egress_access_denied_obeys_reject_inconclusive(self):
+        attempts = [
+            {
+                "classification": "egress_access_denied",
+                "confidence": "inconclusive",
+                "http_status": 403,
+            }
+            for _ in range(3)
+        ]
+        rejected = aggregate_health_attempts(attempts, reject_inconclusive=True)
+        retained = aggregate_health_attempts(attempts, reject_inconclusive=False)
+        self.assertTrue(rejected["reject_candidate"])
+        self.assertEqual(rejected["reject_reason"], "egress_access_denied")
+        self.assertFalse(retained["reject_candidate"])
 
     def test_single_forbidden_followed_by_network_errors_is_not_rejected(self):
         result = aggregate_health_attempts(

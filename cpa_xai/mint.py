@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
+from .auth_code_mint import AuthCodeMintError, GROK_REFERRER, mint_with_sso_auth_code
 from .browser_confirm import mint_with_browser
 from .probe import probe_mini_response, probe_models
 from .protocol_mint import ProtocolMintError, extract_sso_from_cookies, mint_with_sso_protocol
@@ -34,6 +35,7 @@ def _safe_token_metadata(access_token: str) -> dict[str, Any]:
         "client_id": claims.get("client_id") or claims.get("azp"),
         "iat": claims.get("iat"),
         "exp": claims.get("exp"),
+        "referrer": claims.get("referrer"),
         "sub_hash": hashlib.sha256(subject.encode()).hexdigest()[:16] if subject else "",
     }
 
@@ -64,6 +66,44 @@ def _health_rejection_summary(health: dict[str, Any]) -> str:
     return ":".join(parts)
 
 
+def _resolve_required_referrer(
+    required_referrer: str | None,
+    auth_code_require_referrer: bool,
+) -> str:
+    """Resolve the pipeline-wide referrer policy with legacy compatibility."""
+
+    if required_referrer is None:
+        return GROK_REFERRER if auth_code_require_referrer else ""
+    return str(required_referrer).strip()
+
+
+def _token_referrer(tokens: dict[str, Any]) -> str:
+    raw = str(tokens.get("referrer") or "").strip()
+    if raw:
+        return raw
+    try:
+        claims = jwt_payload(str(tokens.get("access_token") or ""))
+    except Exception:
+        return ""
+    return str(claims.get("referrer") or "").strip()
+
+
+def _referrer_policy_error(
+    tokens: dict[str, Any],
+    *,
+    method: str,
+    required_referrer: str,
+) -> str | None:
+    actual = _token_referrer(tokens)
+    tokens["referrer"] = actual
+    if required_referrer and actual != required_referrer:
+        return (
+            f"{method} token referrer={actual!r}; "
+            f"expected {required_referrer!r}"
+        )
+    return None
+
+
 def mint_and_export(
     *,
     email: str,
@@ -81,9 +121,13 @@ def mint_and_export(
     sso: str | None = None,
     reuse_browser: bool = True,
     recycle_every: int = 15,
+    prefer_auth_code: bool = True,
     prefer_protocol: bool = True,
     protocol_only: bool = False,
     protocol_poll_timeout_sec: float = 90.0,
+    auth_code_timeout_sec: float = 90.0,
+    auth_code_require_referrer: bool = True,
+    required_referrer: str | None = None,
     health_check: bool = False,
     health_probe_delays: list[float] | tuple[float, ...] = (0,),
     health_reject_inconclusive: bool = True,
@@ -93,16 +137,20 @@ def mint_and_export(
 ) -> dict[str, Any]:
     """Full pipeline: mint OIDC → optional health gate → optional write → legacy probe.
 
-    Protocol path (curl_cffi + sso cookie) is tried first when prefer_protocol
-    and an sso cookie is available. On failure, falls back to browser mint unless
-    protocol_only=True.
+    Mint order when SSO is available:
+      1) Authorization Code + PKCE (``referrer=grok-build``) if prefer_auth_code
+      2) Device-code protocol HTTP if prefer_protocol
+      3) Browser device consent (unless protocol_only)
 
     Returns dict with keys: ok, path, email, probe, error?, mint_method?
     """
     log = log or _noop
+    pipeline_referrer = _resolve_required_referrer(
+        required_referrer, auth_code_require_referrer
+    )
     email = (email or "").strip()
     if not email or not password:
-        # Protocol can work with sso alone; password only required for browser fallback
+        # Auth-code/protocol can work with sso alone; password only for browser fallback
         if not email:
             return {"ok": False, "email": email, "error": "missing email"}
         if not (sso or extract_sso_from_cookies(cookies)):
@@ -117,8 +165,45 @@ def mint_and_export(
     sso_val = (sso or "").strip() or extract_sso_from_cookies(cookies)
     tokens: dict[str, Any] | None = None
     protocol_err: str | None = None
+    auth_code_err: str | None = None
 
-    if prefer_protocol and sso_val:
+    if prefer_auth_code and sso_val:
+        log("mint try auth-code (SSO PKCE referrer=grok-build)")
+        try:
+            tokens = mint_with_sso_auth_code(
+                sso_cookie=sso_val,
+                email=email,
+                proxy=resolved or None,
+                total_timeout_sec=auth_code_timeout_sec,
+                require_referrer=False,
+                required_referrer="",
+                log=log,
+                cancel=cancel,
+            )
+            policy_error = _referrer_policy_error(
+                tokens,
+                method="auth-code",
+                required_referrer=pipeline_referrer,
+            )
+            if policy_error:
+                raise AuthCodeMintError(policy_error)
+            log("mint auth-code SUCCESS")
+        except AuthCodeMintError as e:
+            auth_code_err = str(e)
+            tokens = None
+            log(f"mint auth-code failed: {e}")
+            if cancel and cancel():
+                return {"ok": False, "email": email, "error": "cancelled"}
+        except Exception as e:  # noqa: BLE001
+            auth_code_err = str(e)
+            tokens = None
+            log(f"mint auth-code exception: {e}")
+            if cancel and cancel():
+                return {"ok": False, "email": email, "error": "cancelled"}
+    elif prefer_auth_code and not sso_val:
+        log("mint auth-code skipped (no sso cookie)")
+
+    if tokens is None and prefer_protocol and sso_val:
         log("mint try protocol (SSO HTTP device flow)")
         try:
             tokens = mint_with_sso_protocol(
@@ -129,9 +214,17 @@ def mint_and_export(
                 log=log,
                 cancel=cancel,
             )
+            policy_error = _referrer_policy_error(
+                tokens,
+                method="protocol",
+                required_referrer=pipeline_referrer,
+            )
+            if policy_error:
+                raise ProtocolMintError(policy_error)
             log("mint protocol SUCCESS")
         except ProtocolMintError as e:
             protocol_err = str(e)
+            tokens = None
             log(f"mint protocol failed: {e}")
             if cancel and cancel():
                 return {"ok": False, "email": email, "error": "cancelled"}
@@ -141,10 +234,12 @@ def mint_and_export(
                     "email": email,
                     "error": f"protocol_only: {e}",
                     "mint_method": "protocol",
+                    "auth_code_error": auth_code_err,
                 }
             log("mint fallback → browser")
         except Exception as e:  # noqa: BLE001
             protocol_err = str(e)
+            tokens = None
             log(f"mint protocol exception: {e}")
             if protocol_only:
                 return {
@@ -152,9 +247,10 @@ def mint_and_export(
                     "email": email,
                     "error": f"protocol_only: {e}",
                     "mint_method": "protocol",
+                    "auth_code_error": auth_code_err,
                 }
             log("mint fallback → browser")
-    elif prefer_protocol and not sso_val:
+    elif tokens is None and prefer_protocol and not sso_val:
         log("mint protocol skipped (no sso cookie) → browser")
         if protocol_only:
             return {
@@ -162,19 +258,33 @@ def mint_and_export(
                 "email": email,
                 "error": "protocol_only but no sso cookie",
                 "mint_method": "protocol",
+                "auth_code_error": auth_code_err,
             }
-    elif not prefer_protocol:
+    elif tokens is None and not prefer_protocol:
         log("mint protocol disabled → browser")
 
     if tokens is None:
         if cancel and cancel():
             return {"ok": False, "email": email, "error": "cancelled"}
+        if protocol_only:
+            return {
+                "ok": False,
+                "email": email,
+                "error": protocol_err
+                or auth_code_err
+                or "protocol_only and no tokens",
+                "protocol_error": protocol_err,
+                "auth_code_error": auth_code_err,
+            }
         if not password:
             return {
                 "ok": False,
                 "email": email,
-                "error": protocol_err or "protocol failed and no password for browser fallback",
+                "error": protocol_err
+                or auth_code_err
+                or "mint failed and no password for browser fallback",
                 "protocol_error": protocol_err,
+                "auth_code_error": auth_code_err,
             }
         try:
             tokens = mint_with_browser(
@@ -192,18 +302,30 @@ def mint_and_export(
                 cancel=cancel,
             )
             tokens["mint_method"] = "browser"
+            policy_error = _referrer_policy_error(
+                tokens,
+                method="browser",
+                required_referrer=pipeline_referrer,
+            )
+            if policy_error:
+                raise AuthCodeMintError(policy_error)
             if protocol_err:
                 tokens["protocol_error"] = protocol_err
+            if auth_code_err:
+                tokens["auth_code_error"] = auth_code_err
         except Exception as e:  # noqa: BLE001
             log(f"mint failed: {e}")
             err = str(e)
             if protocol_err:
                 err = f"{err} (protocol: {protocol_err})"
+            if auth_code_err:
+                err = f"{err} (auth_code: {auth_code_err})"
             return {
                 "ok": False,
                 "email": email,
                 "error": err,
                 "protocol_error": protocol_err,
+                "auth_code_error": auth_code_err,
             }
 
     result: dict[str, Any] = {
@@ -215,7 +337,9 @@ def mint_and_export(
         "mint_method": tokens.get("mint_method") or "browser",
         "token_metadata": _safe_token_metadata(str(tokens.get("access_token") or "")),
     }
-    if protocol_err and result["mint_method"] != "protocol":
+    if auth_code_err and result["mint_method"] != "auth_code":
+        result["auth_code_error"] = auth_code_err
+    if protocol_err and result["mint_method"] not in {"protocol", "auth_code"}:
         result["protocol_error"] = protocol_err
 
     if cancel and cancel():

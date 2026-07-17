@@ -77,3 +77,38 @@
 - [x] 将追踪写入与报告异常和注册主流程隔离
 - [x] 使用真实批次数据重新生成报告
 - [x] 运行全量测试并重启 GUI
+
+## Clash 美国节点自动轮询
+
+- [x] 实现 `proxy_rotation.py`（Clash API / 出口探测 / 按 IP 冷却 / lease）
+- [x] 单元测试 mock controller（10 项通过）
+- [x] CLI/GUI 接入：开启时强制串行 + 每账号 acquire/release
+- [x] 健康审计写入 egress_ip / clash_node
+- [x] config.example.json + 本机 config.json（飞鸟云 / 127.0.0.1:9090）
+- [x] 本机 live smoke：list/switch/probe/acquire-test
+- [ ] 用户真实批量注册验证不同节点轮换与成功率
+
+## 注册成功率与轮换可靠性优化
+
+- [x] 健康门与最终 CPA 统一 grok-pager 请求指纹并区分通用出口 403
+- [x] auth-code 增加严格 referrer、总 deadline、取消和直接 callback 支持
+- [x] rotation 改为 fail-closed、强制美国地区、确认切换并增加跨进程互斥
+- [x] GUI/CLI 正确传递健康终态、关闭跨节点浏览器复用并修复重试 lease
+- [x] 连续通用 403 熔断批次并完善匿名出口审计与状态统计
+- [x] 更新配置模板和当前安全默认值
+- [x] 增加回归测试并完成全量测试、语法、diff 与 JSON 校验
+
+## CPA 账号网页重新激活与安全健康门复验
+
+- [x] 盘点 `cpa_auths` 34 个活动账号并确认 16 个账本覆盖且无重复
+- [x] 增加临时输出、健康通过后原子替换、失败保留原文件的安全包装器
+- [ ] 串行完成网页激活、OAuth mint 和健康门复验
+- [ ] 核对成功/失败汇总、文件完整性和代理 403 熔断结论
+
+## Code Review 可靠性修复
+
+- [x] 修复异步 mint 双终态、rotation 浏览器复用和 GUI lease 释放顺序
+- [x] 修复 auth-code consent callback 跳转并增加最终 referrer 策略门
+- [x] 拆分模糊 403 cooldown / breaker，修复地区未知与默认节点过滤
+- [x] 修复 CPA 重激活重复结果和模糊 403 误熔断
+- [x] 补齐离线回归测试并完成 pytest、unittest、语法、JSON 和 diff 校验

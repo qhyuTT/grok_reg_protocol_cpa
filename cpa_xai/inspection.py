@@ -18,15 +18,14 @@ from typing import Any, Mapping
 from curl_cffi import requests as cf_requests
 
 from .proxyutil import resolve_proxy
-from .schema import DEFAULT_BASE_URL
+from .schema import DEFAULT_BASE_URL, DEFAULT_CLIENT_HEADERS
 
 PREFERRED_MODELS = ("grok-4.5-build-free", "grok-4.5", "grok-4", "grok-3-mini")
 _FALLBACK_STATUSES = {401, 402, 403, 429}
-INSPECTION_CLIENT_HEADERS = {
-    "X-XAI-Token-Auth": "xai-grok-cli",
-    "x-grok-client-version": "0.2.93",
-    "User-Agent": "xai-grok-workspace/0.2.93",
-}
+# Keep the probe fingerprint identical to the headers written into the final
+# CPA credential.  A probe using a different client profile can otherwise
+# reject a credential that the real consumer would accept (or vice versa).
+INSPECTION_CLIENT_HEADERS = dict(DEFAULT_CLIENT_HEADERS)
 
 
 def _as_string(value: Any) -> str:
@@ -337,6 +336,15 @@ def inspect_access_token(
         "error_code": "",
         "error_message": "",
         "primary_endpoint": f"{base}/responses",
+        "headers_profile": {
+            "user_agent": INSPECTION_CLIENT_HEADERS.get("User-Agent", ""),
+            "client_identifier": INSPECTION_CLIENT_HEADERS.get(
+                "x-grok-client-identifier", ""
+            ),
+            "client_version": INSPECTION_CLIENT_HEADERS.get(
+                "x-grok-client-version", ""
+            ),
+        },
     }
 
     models = _request_json(client, "GET", f"{base}/models", token=access_token, payload=None, timeout=timeout)
@@ -429,6 +437,39 @@ def inspect_access_token(
                 "confidence": "inconclusive",
             }
 
+        model_class = classify_probe(
+            models["status"],
+            code=model_error["code"],
+            error=model_error["message"],
+            request_error=models["request_error"],
+        )
+        fallback_class = classify_probe(
+            fallback["status"],
+            code=fallback_error["code"],
+            error=fallback_error["message"],
+            request_error=fallback["request_error"],
+        )
+        if (
+            models["status"] == 403
+            and main_status == 403
+            and fallback["status"] == 403
+            and model_class["classification"] == "forbidden_unknown"
+            and classify_probe(
+                main_status,
+                code=main_error["code"],
+                error=main_error["message"],
+                request_error=responses["request_error"],
+            )["classification"]
+            == "forbidden_unknown"
+            and fallback_class["classification"] == "forbidden_unknown"
+        ):
+            main_class = {
+                "classification": "egress_access_denied",
+                "action": "keep",
+                "reason": "所有 CPA 接口均返回无明确账号证据的 HTTP 403",
+                "confidence": "inconclusive",
+            }
+
     result.update(main_class)
     result["ok"] = result["classification"] == "healthy"
     return result
@@ -487,6 +528,7 @@ def aggregate_health_attempts(
             "permission_denied",
             "forbidden_unknown",
             "endpoint_inconsistent",
+            "egress_access_denied",
         }
         for value in classes
     )
@@ -494,6 +536,10 @@ def aggregate_health_attempts(
         value == "endpoint_inconsistent" for value in classes
     ):
         classification = "endpoint_inconsistent"
+    elif persistent_access_failure and all(
+        value == "egress_access_denied" for value in classes
+    ):
+        classification = "egress_access_denied"
     elif persistent_access_failure:
         classification = "forbidden_unknown"
     elif all(value == "reauth" for value in classes):
@@ -510,7 +556,8 @@ def aggregate_health_attempts(
     final = dict(rows[-1])
     reject = classification == "reauth" or bool(
         reject_inconclusive
-        and classification in {"forbidden_unknown", "endpoint_inconsistent"}
+        and classification
+        in {"forbidden_unknown", "endpoint_inconsistent", "egress_access_denied"}
     )
     confidence = (
         "confirmed"
@@ -524,6 +571,7 @@ def aggregate_health_attempts(
         reason={
             "forbidden_unknown": "连续探测仍返回无法确认原因的禁止访问",
             "endpoint_inconsistent": "主接口与备用接口连续返回不一致结果",
+            "egress_access_denied": "连续探测确认当前出口无法访问 CPA 接口",
             "reauth": "连续探测确认认证已过期或失效",
         }.get(classification, str(final.get("reason") or "健康探测未通过")),
         reject_candidate=reject,

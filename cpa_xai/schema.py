@@ -16,12 +16,13 @@ DEFAULT_REDIRECT_URI = "http://127.0.0.1:56121/callback"
 # Free Build promo path (NOT api.x.ai)
 DEFAULT_BASE_URL = "https://cli-chat-proxy.grok.com/v1"
 
+# Align with grok-build-auth / grok-pager (CPA free Build channel).
 DEFAULT_CLIENT_HEADERS: dict[str, str] = {
     "x-grok-client-version": "0.2.93",
     "x-xai-token-auth": "xai-grok-cli",
     "x-authenticateresponse": "authenticate-response",
-    "x-grok-client-identifier": "grok-shell",
-    "User-Agent": "grok-shell/0.2.93 (linux; x86_64)",
+    "x-grok-client-identifier": "grok-pager",
+    "User-Agent": "grok-pager/0.2.93 grok-shell/0.2.93 (linux; x86_64)",
 }
 
 

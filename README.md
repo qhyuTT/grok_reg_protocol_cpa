@@ -139,6 +139,9 @@ email----password----sso
 | `register_threads` | GUI 注册并发数 |
 | `cpa_export_enabled` | 是否导出 CPA 认证文件 |
 | `registration_health_check_enabled` | 是否检查新账号可用性 |
+| `cpa_required_referrer` | 最终 CPA token 必须携带的 referrer，默认 `grok-build`；空字符串可关闭严格策略 |
+| `cpa_auth_code_require_referrer` | 旧版兼容开关；仅在缺少 `cpa_required_referrer` 时生效 |
+| `proxy_rotation_enabled` | 是否通过 Clash controller 按账号轮换美国出口；开启后强制串行 |
 
 其余选项直接查看 [`config.example.json`](config.example.json) 中的注释。
 
@@ -149,6 +152,7 @@ email----password----sso
 - 修改配置未生效：完全退出正在运行的 GUI 后重新启动。
 - 账号被检查淘汰：查看 `cpa_auths/registration_health_audit.jsonl`。
 - 注册成功但没有 CPA 文件：检查 `cpa_export_enabled` 和运行日志。
+- rotation 开启后批次主动停止：检查 controller、代理端口、美国地区探测和通用 403 熔断日志；系统会 fail-closed，避免静默复用被拒出口。
 
 更多说明：
 

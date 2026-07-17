@@ -81,6 +81,7 @@ def _health_attempt_for_audit(item: dict[str, Any]) -> dict[str, Any]:
         "fallback_content_type": item.get("fallback_content_type"),
         "fallback_duration_ms": item.get("fallback_duration_ms"),
         "fallback_raw_snippet": _redact_audit_text(item.get("fallback_raw_snippet")),
+        "headers_profile": item.get("headers_profile") or {},
     }
 
 
@@ -101,11 +102,28 @@ def _write_health_audit(
     path = Path(raw_path).expanduser()
     if not path.is_absolute():
         path = (_REG_DIR / path).resolve()
+    egress: dict[str, Any] = {}
+    raw_egress = cfg.get("_egress")
+    if isinstance(raw_egress, dict):
+        egress = raw_egress
+    else:
+        try:
+            import proxy_rotation as _proxy_rot
+
+            meta = _proxy_rot.get_manager(cfg).current_lease_metadata()
+            if isinstance(meta, dict):
+                egress = meta
+        except Exception:
+            egress = {}
     record = {
         "timestamp": int(time.time()),
         "email": email,
         "mint_method": result.get("mint_method"),
         "proxy": result.get("proxy"),
+        "egress_ip": str(egress.get("egress_ip") or ""),
+        "egress_country": str(egress.get("country") or ""),
+        "clash_node": str(egress.get("node_name") or ""),
+        "proxy_lease_id": str(egress.get("lease_id") or ""),
         "token_metadata": result.get("token_metadata") or {},
         "classification": health.get("classification"),
         "confidence": health.get("confidence"),
@@ -232,10 +250,22 @@ def export_cpa_xai_for_account(
     cookie_inject = bool(cfg.get("cpa_mint_cookie_inject", True))
     reuse_browser = bool(cfg.get("cpa_mint_browser_reuse", True))
     recycle_every = int(cfg.get("cpa_mint_browser_recycle_every", 15) or 0)
-    # Protocol (pure HTTP SSO device flow) first; browser only on failure.
+    # Auth-code PKCE (referrer=grok-build) first; then device protocol; browser last.
+    prefer_auth_code = bool(cfg.get("cpa_prefer_auth_code", True))
     prefer_protocol = bool(cfg.get("cpa_prefer_protocol", True))
     protocol_only = bool(cfg.get("cpa_protocol_only", False))
     protocol_poll_timeout = float(cfg.get("cpa_protocol_poll_timeout_sec", 90) or 90)
+    auth_code_timeout = float(cfg.get("cpa_auth_code_timeout_sec", 90) or 90)
+    auth_code_require_referrer = bool(cfg.get("cpa_auth_code_require_referrer", True))
+    if "cpa_required_referrer" in cfg:
+        raw_required_referrer = cfg.get("cpa_required_referrer")
+        required_referrer = (
+            "" if raw_required_referrer is None else str(raw_required_referrer).strip()
+        )
+    else:
+        # Backward compatibility: the old auth-code-only switch now controls
+        # the pipeline-wide policy when the new key is absent.
+        required_referrer = "grok-build" if auth_code_require_referrer else ""
     health_probe_delays = _parse_health_delays(
         cfg.get("registration_health_probe_delays_sec", [0, 15, 45])
     )
@@ -282,7 +312,7 @@ def export_cpa_xai_for_account(
     log(
         f"[cpa] mint OIDC for {email} -> {out_dir} proxy={proxy or '(none)'} "
         f"cookies={len(use_cookies) if isinstance(use_cookies, list) else (1 if use_cookies else 0)} "
-        f"reuse={reuse_browser} protocol={prefer_protocol}"
+        f"reuse={reuse_browser} auth_code={prefer_auth_code} protocol={prefer_protocol}"
         f"{' only' if protocol_only else ''} sso={'yes' if sso_val else 'no'}"
     )
 
@@ -305,9 +335,13 @@ def export_cpa_xai_for_account(
         sso=sso_val or None,
         reuse_browser=reuse_browser,
         recycle_every=recycle_every,
+        prefer_auth_code=prefer_auth_code,
         prefer_protocol=prefer_protocol,
         protocol_only=protocol_only,
         protocol_poll_timeout_sec=protocol_poll_timeout,
+        auth_code_timeout_sec=auth_code_timeout,
+        auth_code_require_referrer=auth_code_require_referrer,
+        required_referrer=required_referrer,
         health_check=health_enabled,
         health_probe_delays=health_probe_delays,
         health_reject_inconclusive=health_reject_inconclusive,

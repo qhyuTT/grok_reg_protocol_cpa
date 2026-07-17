@@ -133,6 +133,72 @@ _SCHEDULER_DONE = threading.Event()
 _accounts_lock = threading.Lock()
 
 
+def _rotation_enabled_config(config: dict | None) -> bool:
+    value = (config or {}).get("proxy_rotation_enabled", False)
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _prepare_rotation_manager(config: dict, log_callback=None):
+    """Validate rotation before workers can consume an email and reset batch state."""
+    if not _rotation_enabled_config(config):
+        return None
+    import proxy_rotation as proxy_rot
+
+    validator = getattr(proxy_rot, "validate_rotation_config", None)
+    if callable(validator):
+        validator(config)
+    manager = proxy_rot.get_manager(config, log=log_callback)
+    reset_breaker = getattr(manager, "reset_batch_breaker", None)
+    if callable(reset_breaker):
+        reset_breaker()
+    return manager
+
+
+def _rotation_should_stop_batch(manager) -> bool:
+    if manager is None:
+        return False
+    for name in ("should_stop_batch", "batch_breaker_tripped"):
+        checker = getattr(manager, name, None)
+        if callable(checker):
+            try:
+                if checker():
+                    return True
+            except Exception:
+                continue
+    return False
+
+
+def _release_rotation_lease(
+    worker_id: int | str,
+    manager,
+    lease,
+    status: str,
+    mint_result: dict[str, Any] | None = None,
+) -> bool:
+    """Release a lease and return whether the batch breaker is now open."""
+    if manager is None or lease is None:
+        return False
+    try:
+        import proxy_rotation as proxy_rot
+
+        outcome = proxy_rot.map_registration_outcome(status, mint_result)
+        manager.release(lease, outcome)
+    except Exception as exc:
+        log(worker_id, f"[proxy-rot] release failed; stop batch: {exc}")
+        _REGISTER_STOP.set()
+        return True
+    if _rotation_should_stop_batch(manager):
+        log(
+            worker_id,
+            "[proxy-rot] 连续出口访问拒绝已触发批次熔断；停止派发剩余任务",
+        )
+        _REGISTER_STOP.set()
+        return True
+    return False
+
+
 def resolve_mint_workers(
     *,
     cli_value: int,
@@ -333,8 +399,13 @@ def register_one(
 
         # Close by default (or clear only when reuse was explicitly enabled)
         # BEFORE mint so registration and CPA browsers do not overlap needlessly.
+        # A rotation lease must never retain Chromium across a node switch, even
+        # when this function is invoked directly instead of through CLI main().
         try:
-            reg.prepare_browser_for_next_account(log_callback=lambda m: log(worker_id, m))
+            reg.prepare_browser_for_next_account(
+                log_callback=lambda m: log(worker_id, m),
+                force_recycle=_rotation_enabled_config(getattr(reg, "config", {}) or {}),
+            )
         except Exception:
             try:
                 reg.stop_browser()
@@ -379,6 +450,10 @@ def _run_mint_job(worker_id: int | str, job: dict[str, Any], config: dict) -> di
     try:
         import cpa_export
 
+        mint_cfg = dict(config or {})
+        if job.get("egress") and "_egress" not in mint_cfg:
+            mint_cfg["_egress"] = job["egress"]
+
         # page=None always — force standalone path inside export
         result = cpa_export.export_cpa_xai_for_account(
             email,
@@ -386,7 +461,7 @@ def _run_mint_job(worker_id: int | str, job: dict[str, Any], config: dict) -> di
             page=None,
             cookies=job.get("cookies"),
             sso=job.get("sso") or "",
-            config=config,
+            config=mint_cfg,
             log_callback=lambda m: log(worker_id, m),
             cancel=_REGISTER_STOP.is_set,
         )
@@ -544,70 +619,139 @@ def _register_worker(
         retry = 0
         candidate = None
         activation_failure = None
-        while retry < 2 and not _REGISTER_STOP.is_set() and not _REGISTER_CAPACITY_STOP.is_set():
-            result = None
-            try:
-                result = register_one(
-                    worker_id,
-                    idx,
-                    total,
-                )
-                if result:
-                    candidate = result
-                    break
-                if _REGISTER_CAPACITY_STOP.is_set():
-                    break
-                retry += 1
-                if retry < 2 and not _REGISTER_STOP.is_set():
-                    log(worker_id, f"[retry] 账号 {idx} 失败，重试 {retry}/1")
-            except reg.ActivationFailedRegistration as exc:
-                activation_failure = exc
-                _inc("activation_failed")
-                log(worker_id, f"[-] Web 激活失败，候选淘汰: {exc.reason}")
-                break
-            except Exception:
-                retry += 1
-                if retry < 2 and not _REGISTER_STOP.is_set():
-                    log(worker_id, f"[retry] 账号 {idx} 异常，重试 {retry}/1")
-                    traceback.print_exc()
-            finally:
-                # Failed sessions are always dirty. Successful sessions are
-                # also closed unless --browser-reuse was explicitly enabled.
-                if not result or not reg.PERF_FLAGS.get("browser_reuse", False):
-                    try:
-                        reg.stop_browser()
-                    except Exception:
-                        pass
+        terminal_status = "failed"
+        outcome_deferred = False
+        mint_result_for_rot: dict | None = None
+        emit_job: dict = task
+        rot_mgr = None
+        lease = None
+        try:
+            cfg = getattr(reg, "config", {}) or {}
+            if _rotation_enabled_config(cfg):
+                try:
+                    import proxy_rotation as proxy_rot
 
-        if candidate:
-            candidate.update(task)
-            if do_mint_inline:
-                mint_result = _run_mint_job(f"R{worker_id}", candidate, getattr(reg, "config", {}) or {})
-                if _REGISTER_STOP.is_set():
-                    status = "failed"
-                else:
-                    status = _safe_finalize_candidate(
-                        f"R{worker_id}", candidate, mint_result, accounts_file
+                    rot_mgr = proxy_rot.get_manager(
+                        cfg,
+                        log=lambda m: log(worker_id, m),
                     )
-                _emit_outcome(outcome_queue, candidate, status)
-            elif mint_queue is not None:
-                qmax = int(getattr(mint_queue, "_reg_qmax", 0) or 0)
-                while qmax > 0 and mint_queue.qsize() >= qmax and not _REGISTER_STOP.is_set():
-                    log(worker_id, f"[cpa] mint 队列背压 qsize={mint_queue.qsize()}≥{qmax}，等待...")
-                    time.sleep(1.0)
-                candidate["accounts_file"] = accounts_file
-                candidate["outcome_queue"] = outcome_queue
-                mint_queue.put(candidate)
-                log(worker_id, f"[cpa] enqueued health+mint for {candidate.get('email')} (queue≈{mint_queue.qsize()})")
+                except Exception as exc:
+                    log(worker_id, f"[proxy-rot] manager unavailable; stop batch: {exc}")
+                    _REGISTER_STOP.set()
+
+            while retry < 2 and not _REGISTER_STOP.is_set() and not _REGISTER_CAPACITY_STOP.is_set():
+                result = None
+                if rot_mgr is not None:
+                    try:
+                        lease = rot_mgr.acquire(cancel=_REGISTER_STOP.is_set)
+                    except Exception as exc:
+                        log(worker_id, f"[proxy-rot] 无法获取合格出口，批次停止: {exc}")
+                        _REGISTER_STOP.set()
+                        terminal_status = "failed"
+                        break
+                try:
+                    result = register_one(
+                        worker_id,
+                        idx,
+                        total,
+                    )
+                    if result:
+                        candidate = result
+                        break
+                    if _REGISTER_CAPACITY_STOP.is_set():
+                        break
+                    _release_rotation_lease(worker_id, rot_mgr, lease, "failed")
+                    lease = None
+                    retry += 1
+                    if retry < 2 and not _REGISTER_STOP.is_set():
+                        log(
+                            worker_id,
+                            f"[retry] 账号 {idx} 失败，释放当前出口并重新获取 lease，重试 {retry}/1",
+                        )
+                except reg.ActivationFailedRegistration as exc:
+                    activation_failure = exc
+                    _inc("activation_failed")
+                    log(worker_id, f"[-] Web 激活失败，候选淘汰: {exc.reason}")
+                    break
+                except Exception:
+                    _release_rotation_lease(worker_id, rot_mgr, lease, "failed")
+                    lease = None
+                    retry += 1
+                    if retry < 2 and not _REGISTER_STOP.is_set():
+                        log(
+                            worker_id,
+                            f"[retry] 账号 {idx} 异常，释放当前出口并重新获取 lease，重试 {retry}/1",
+                        )
+                        traceback.print_exc()
+                finally:
+                    # Failed sessions are always dirty. Successful sessions are
+                    # also closed unless --browser-reuse was explicitly enabled.
+                    if (
+                        not result
+                        or rot_mgr is not None
+                        or not reg.PERF_FLAGS.get("browser_reuse", False)
+                    ):
+                        try:
+                            reg.stop_browser()
+                        except Exception:
+                            pass
+
+            if candidate:
+                candidate.update(task)
+                emit_job = candidate
+                if lease is not None and rot_mgr is not None:
+                    candidate["egress"] = rot_mgr.describe(lease)
+                if do_mint_inline or rot_mgr is not None:
+                    mint_cfg = dict(getattr(reg, "config", {}) or {})
+                    if rot_mgr is not None:
+                        mint_cfg["cpa_mint_browser_reuse"] = False
+                    if candidate.get("egress"):
+                        mint_cfg["_egress"] = candidate["egress"]
+                    mint_result = _run_mint_job(f"R{worker_id}", candidate, mint_cfg)
+                    mint_result_for_rot = mint_result if isinstance(mint_result, dict) else None
+                    if _REGISTER_STOP.is_set():
+                        terminal_status = "failed"
+                    else:
+                        terminal_status = _safe_finalize_candidate(
+                            f"R{worker_id}", candidate, mint_result, accounts_file
+                        )
+                elif mint_queue is not None:
+                    qmax = int(getattr(mint_queue, "_reg_qmax", 0) or 0)
+                    while qmax > 0 and mint_queue.qsize() >= qmax and not _REGISTER_STOP.is_set():
+                        log(worker_id, f"[cpa] mint 队列背压 qsize={mint_queue.qsize()}≥{qmax}，等待...")
+                        time.sleep(1.0)
+                    candidate["accounts_file"] = accounts_file
+                    candidate["outcome_queue"] = outcome_queue
+                    # Without serial rotation, mint worker may run after another
+                    # account switched nodes — keep egress metadata for audit only.
+                    mint_queue.put(candidate)
+                    log(
+                        worker_id,
+                        f"[cpa] enqueued health+mint for {candidate.get('email')} "
+                        f"(queue≈{mint_queue.qsize()})",
+                    )
+                    # The mint worker owns the only terminal outcome for this
+                    # attempt. Emitting here would let the scheduler complete the
+                    # slot before the health gate can reject and request a refill.
+                    outcome_deferred = True
+                else:
+                    terminal_status = _safe_finalize_candidate(
+                        worker_id, candidate, {"ok": False, "skipped": True}, accounts_file
+                    )
+            elif activation_failure is not None:
+                terminal_status = "activation_failed"
             else:
-                status = _safe_finalize_candidate(
-                    worker_id, candidate, {"ok": False, "skipped": True}, accounts_file
-                )
-                _emit_outcome(outcome_queue, candidate, status)
-        elif activation_failure is not None:
-            _emit_outcome(outcome_queue, task, "activation_failed")
-        else:
-            _emit_outcome(outcome_queue, task, "failed")
+                terminal_status = "failed"
+        finally:
+            _release_rotation_lease(
+                worker_id,
+                rot_mgr,
+                lease,
+                terminal_status,
+                mint_result_for_rot,
+            )
+        if not outcome_deferred:
+            _emit_outcome(outcome_queue, emit_job, terminal_status)
         task_queue.task_done()
 
     # worker exit: free browser
@@ -701,6 +845,18 @@ def main() -> int:
 
     reg.load_config()
     cfg0 = getattr(reg, "config", {}) or {}
+    try:
+        rotation_manager = _prepare_rotation_manager(
+            cfg0,
+            log_callback=lambda message: print(message, flush=True),
+        )
+    except Exception as exc:
+        print(f"[proxy-rot] 配置/出口校验失败，任务未启动: {exc}", flush=True)
+        return 1
+    rotation_active = rotation_manager is not None
+    if rotation_active:
+        # One mixed-port lease must cover register + mint + health as one serial unit.
+        cfg0["cpa_mint_browser_reuse"] = False
     threads = max(1, min(args.threads, 10))
     fast = bool(args.fast) and not bool(args.no_fast)
 
@@ -710,6 +866,23 @@ def main() -> int:
         config=cfg0,
         inline_mint=bool(args.inline_mint),
     )
+    try:
+        import proxy_rotation as _proxy_rot
+
+        threads, mint_workers, rot_forced = _proxy_rot.apply_rotation_concurrency(
+            cfg0, threads, mint_workers
+        )
+        if rot_forced:
+            print(
+                f"[proxy-rot] rotation enabled → force register_threads=1 mint_workers=0 "
+                f"(was threads={args.threads} mint_workers={args.mint_workers})",
+                flush=True,
+            )
+    except Exception as exc:
+        if rotation_active:
+            print(f"[proxy-rot] 并发约束失败，任务未启动: {exc}", flush=True)
+            return 1
+        print(f"[proxy-rot] concurrency clamp skipped: {exc}", flush=True)
     do_mint_inline = mint_workers == 0
     mint_qmax = resolve_mint_queue_max(
         cfg0,
@@ -718,13 +891,19 @@ def main() -> int:
     )
 
     # perf knobs
+    requested_browser_reuse = bool(args.browser_reuse) and not bool(args.no_browser_reuse)
+    if rotation_active and requested_browser_reuse:
+        print(
+            "[proxy-rot] rotation enabled → disable registration browser reuse",
+            flush=True,
+        )
     reg.configure_perf(
         fast=fast,
         sleep_scale=0.15 if fast else 1.0,
         skip_debug_io=fast,
         cookie_snapshot=bool(args.cookie_snapshot) or not fast,
         async_side_effects=True,
-        browser_reuse=bool(args.browser_reuse) and not bool(args.no_browser_reuse),
+        browser_reuse=requested_browser_reuse and not rotation_active,
         browser_recycle_every=max(1, int(args.browser_recycle_every)),
     )
 

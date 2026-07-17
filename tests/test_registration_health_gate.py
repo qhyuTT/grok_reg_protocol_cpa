@@ -20,6 +20,7 @@ class MintHealthGateTests(unittest.TestCase):
             "refresh_token": "refresh-token",
             "expires_in": 3600,
             "mint_method": "protocol",
+            "referrer": "grok-build",
         }
 
     def test_permission_denied_does_not_write_auth_or_return_path(self):
@@ -40,6 +41,7 @@ class MintHealthGateTests(unittest.TestCase):
                 password="secret",
                 auth_dir="unused-auth-dir",
                 sso="sso-cookie",
+                prefer_auth_code=False,
                 health_check=True,
                 health_probe_delays=(0, 0.001),
                 probe=False,
@@ -70,6 +72,7 @@ class MintHealthGateTests(unittest.TestCase):
                 password="secret",
                 auth_dir="auth-dir",
                 sso="sso-cookie",
+                prefer_auth_code=False,
                 health_check=True,
                 probe=False,
             )
@@ -80,6 +83,194 @@ class MintHealthGateTests(unittest.TestCase):
         self.assertFalse(result["health"]["reject_candidate"])
         self.assertEqual(result["path"], str(expected_path))
         writer.assert_called_once()
+
+    def test_export_passes_strict_auth_code_defaults_and_timeout(self):
+        with tempfile.TemporaryDirectory() as tempdir, patch.object(
+            cpa_xai,
+            "mint_and_export",
+            return_value={"ok": True},
+        ) as mint:
+            cpa_export.export_cpa_xai_for_account(
+                "user@example.com",
+                "secret",
+                sso="sso-cookie",
+                config={
+                    "cpa_auth_dir": tempdir,
+                    "cpa_probe_after_write": False,
+                },
+                log_callback=lambda _message: None,
+            )
+
+        kwargs = mint.call_args.kwargs
+        self.assertEqual(kwargs["auth_code_timeout_sec"], 90.0)
+        self.assertTrue(kwargs["auth_code_require_referrer"])
+        self.assertEqual(kwargs["required_referrer"], "grok-build")
+        self.assertEqual(kwargs["health_probe_delays"], [0.0, 15.0, 45.0])
+
+    def test_invalid_protocol_referrer_falls_back_to_browser_before_health(self):
+        browser_tokens = {
+            "access_token": "browser-access",
+            "refresh_token": "browser-refresh",
+            "expires_in": 3600,
+            "referrer": "grok-build",
+        }
+        health = {"classification": "healthy", "confidence": "confirmed"}
+        expected_path = Path("/tmp/xai-referrer-fallback@example.com.json")
+        with (
+            patch.object(
+                mint_module,
+                "mint_with_sso_protocol",
+                return_value={
+                    "access_token": "protocol-access",
+                    "refresh_token": "protocol-refresh",
+                    "expires_in": 3600,
+                    "mint_method": "protocol",
+                },
+            ),
+            patch.object(mint_module, "mint_with_browser", return_value=browser_tokens),
+            patch("cpa_xai.inspection.inspect_access_token", return_value=health) as inspect,
+            patch.object(mint_module, "write_cpa_xai_auth", return_value=expected_path) as writer,
+        ):
+            result = cpa_xai.mint_and_export(
+                email="referrer-fallback@example.com",
+                password="secret",
+                auth_dir="auth-dir",
+                sso="sso-cookie",
+                prefer_auth_code=False,
+                health_check=True,
+                probe=False,
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["mint_method"], "browser")
+        self.assertIn("referrer", result["protocol_error"])
+        inspect.assert_called_once()
+        writer.assert_called_once()
+
+    def test_invalid_auth_code_referrer_falls_back_to_protocol(self):
+        expected_path = Path("/tmp/xai-auth-code-fallback@example.com.json")
+        with (
+            patch.object(
+                mint_module,
+                "mint_with_sso_auth_code",
+                return_value={
+                    "access_token": "auth-code-access",
+                    "refresh_token": "auth-code-refresh",
+                    "expires_in": 3600,
+                    "mint_method": "auth_code",
+                },
+            ) as auth_code_mint,
+            patch.object(
+                mint_module,
+                "mint_with_sso_protocol",
+                return_value=self._mint_tokens(),
+            ) as protocol_mint,
+            patch.object(mint_module, "write_cpa_xai_auth", return_value=expected_path),
+        ):
+            result = cpa_xai.mint_and_export(
+                email="auth-code-fallback@example.com",
+                password="secret",
+                auth_dir="auth-dir",
+                sso="sso-cookie",
+                probe=False,
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["mint_method"], "protocol")
+        self.assertIn("referrer", result["auth_code_error"])
+        auth_code_mint.assert_called_once()
+        protocol_mint.assert_called_once()
+
+    def test_invalid_referrer_is_rejected_without_health_or_write(self):
+        with (
+            patch.object(
+                mint_module,
+                "mint_with_sso_protocol",
+                return_value={
+                    "access_token": "protocol-access",
+                    "refresh_token": "protocol-refresh",
+                    "expires_in": 3600,
+                    "mint_method": "protocol",
+                },
+            ),
+            patch.object(
+                mint_module,
+                "mint_with_browser",
+                return_value={
+                    "access_token": "browser-access",
+                    "refresh_token": "browser-refresh",
+                    "expires_in": 3600,
+                },
+            ),
+            patch("cpa_xai.inspection.inspect_access_token") as inspect,
+            patch.object(mint_module, "write_cpa_xai_auth") as writer,
+        ):
+            result = cpa_xai.mint_and_export(
+                email="referrer-rejected@example.com",
+                password="secret",
+                auth_dir="auth-dir",
+                sso="sso-cookie",
+                prefer_auth_code=False,
+                health_check=True,
+                probe=False,
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertIn("referrer", result["error"])
+        inspect.assert_not_called()
+        writer.assert_not_called()
+
+    def test_legacy_referrer_switch_can_disable_pipeline_policy(self):
+        health = {"classification": "healthy", "confidence": "confirmed"}
+        expected_path = Path("/tmp/xai-referrer-disabled@example.com.json")
+        with (
+            patch.object(
+                mint_module,
+                "mint_with_sso_protocol",
+                return_value={
+                    "access_token": "protocol-access",
+                    "refresh_token": "protocol-refresh",
+                    "expires_in": 3600,
+                    "mint_method": "protocol",
+                },
+            ),
+            patch("cpa_xai.inspection.inspect_access_token", return_value=health),
+            patch.object(mint_module, "write_cpa_xai_auth", return_value=expected_path),
+        ):
+            result = cpa_xai.mint_and_export(
+                email="referrer-disabled@example.com",
+                password="secret",
+                auth_dir="auth-dir",
+                sso="sso-cookie",
+                prefer_auth_code=False,
+                auth_code_require_referrer=False,
+                health_check=True,
+                probe=False,
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["mint_method"], "protocol")
+
+    def test_new_required_referrer_config_overrides_legacy_switch(self):
+        with tempfile.TemporaryDirectory() as tempdir, patch.object(
+            cpa_xai,
+            "mint_and_export",
+            return_value={"ok": True},
+        ) as mint:
+            cpa_export.export_cpa_xai_for_account(
+                "user@example.com",
+                "secret",
+                sso="sso-cookie",
+                config={
+                    "cpa_auth_dir": tempdir,
+                    "cpa_probe_after_write": False,
+                    "cpa_auth_code_require_referrer": True,
+                    "cpa_required_referrer": "",
+                },
+                log_callback=lambda _message: None,
+            )
+
+        self.assertEqual(mint.call_args.kwargs["required_referrer"], "")
 
 
 class FinalizeCandidateHealthGateTests(unittest.TestCase):
@@ -162,6 +353,7 @@ class WebActivationReplacementTests(unittest.TestCase):
         register_cli._REGISTER_CAPACITY_STOP.clear()
         register_cli._SCHEDULER_DONE.clear()
         with (
+            patch.dict(register_cli.reg.config, {"proxy_rotation_enabled": False}, clear=False),
             patch.object(
                 register_cli,
                 "register_one",
