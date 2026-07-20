@@ -356,6 +356,7 @@ class BrowserDefaultTests(unittest.TestCase):
                     auth_dir=auth_dir,
                     sso="sso-cookie",
                     prefer_auth_code=False,
+                    skip_device_when_referrer_required=False,
                     probe=False,
                     cancel=lambda: True,
                 )

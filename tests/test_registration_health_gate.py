@@ -48,6 +48,7 @@ class MintHealthGateTests(unittest.TestCase):
                 auth_dir="unused-auth-dir",
                 sso="sso-cookie",
                 prefer_auth_code=False,
+                skip_device_when_referrer_required=False,
                 health_check=True,
                 health_probe_delays=(0, 0.001),
                 probe=False,
@@ -79,6 +80,7 @@ class MintHealthGateTests(unittest.TestCase):
                 auth_dir="auth-dir",
                 sso="sso-cookie",
                 prefer_auth_code=False,
+                skip_device_when_referrer_required=False,
                 health_check=True,
                 health_probe_delays=(0,),
                 probe=False,
@@ -112,6 +114,7 @@ class MintHealthGateTests(unittest.TestCase):
         self.assertEqual(kwargs["auth_code_timeout_sec"], 90.0)
         self.assertTrue(kwargs["auth_code_require_referrer"])
         self.assertEqual(kwargs["required_referrer"], "grok-build")
+        self.assertTrue(kwargs["skip_device_when_referrer_required"])
         self.assertEqual(kwargs["health_probe_delays"], [10.0, 20.0, 45.0])
         self.assertEqual(
             register_cli.reg.DEFAULT_CONFIG["registration_health_probe_delays_sec"],
@@ -150,6 +153,7 @@ class MintHealthGateTests(unittest.TestCase):
                 auth_dir="unused",
                 sso="sso-cookie",
                 prefer_auth_code=False,
+                skip_device_when_referrer_required=False,
                 health_check=True,
                 write_auth=False,
                 probe=False,
@@ -190,6 +194,7 @@ class MintHealthGateTests(unittest.TestCase):
                 auth_dir="unused",
                 sso="sso-cookie",
                 prefer_auth_code=False,
+                skip_device_when_referrer_required=False,
                 health_check=True,
                 write_auth=False,
                 probe=False,
@@ -258,6 +263,7 @@ class MintHealthGateTests(unittest.TestCase):
                         auth_dir="unused",
                         sso="sso-cookie",
                         prefer_auth_code=False,
+                        skip_device_when_referrer_required=False,
                         health_check=True,
                         write_auth=False,
                         probe=False,
@@ -270,7 +276,10 @@ class MintHealthGateTests(unittest.TestCase):
                     offsets,
                 )
 
-    def test_invalid_protocol_referrer_falls_back_to_browser_before_health(self):
+    def test_invalid_protocol_referrer_falls_back_to_browser_when_device_allowed(
+        self,
+    ):
+        """Legacy path: skip_device=false still allows protocol→browser fallback."""
         browser_tokens = {
             "access_token": "browser-access",
             "refresh_token": "browser-refresh",
@@ -300,6 +309,7 @@ class MintHealthGateTests(unittest.TestCase):
                 auth_dir="auth-dir",
                 sso="sso-cookie",
                 prefer_auth_code=False,
+                skip_device_when_referrer_required=False,
                 health_check=True,
                 health_probe_delays=(0,),
                 probe=False,
@@ -311,7 +321,71 @@ class MintHealthGateTests(unittest.TestCase):
         inspect.assert_called_once()
         writer.assert_called_once()
 
-    def test_invalid_auth_code_referrer_falls_back_to_protocol(self):
+    def test_invalid_auth_code_referrer_aborts_device_under_default_policy(self):
+        logs: list[str] = []
+        with (
+            patch.object(
+                mint_module,
+                "mint_with_sso_auth_code",
+                return_value={
+                    "access_token": "auth-code-access",
+                    "refresh_token": "auth-code-refresh",
+                    "expires_in": 3600,
+                    "mint_method": "auth_code",
+                },
+            ) as auth_code_mint,
+            patch.object(mint_module, "mint_with_sso_protocol") as protocol_mint,
+            patch.object(mint_module, "mint_with_browser") as browser_mint,
+            patch.object(mint_module, "write_cpa_xai_auth") as writer,
+        ):
+            result = cpa_xai.mint_and_export(
+                email="auth-code-abort@example.com",
+                password="secret",
+                auth_dir="auth-dir",
+                sso="sso-cookie",
+                probe=False,
+                log=logs.append,
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertTrue(result.get("skipped_device"))
+        self.assertIn("referrer", result["auth_code_error"] or "")
+        self.assertIn("device flows cannot satisfy", result["error"])
+        self.assertIn("auth_code failed", result["error"])
+        auth_code_mint.assert_called_once()
+        protocol_mint.assert_not_called()
+        browser_mint.assert_not_called()
+        writer.assert_not_called()
+        self.assertTrue(any("mint abort:" in row for row in logs))
+
+    def test_auth_code_error_aborts_device_under_referrer_policy(self):
+        with (
+            patch.object(
+                mint_module,
+                "mint_with_sso_auth_code",
+                side_effect=mint_module.AuthCodeMintError(
+                    "consent failed after 2 Next-Action tries: consent HTTP 404"
+                ),
+            ),
+            patch.object(mint_module, "mint_with_sso_protocol") as protocol_mint,
+            patch.object(mint_module, "mint_with_browser") as browser_mint,
+        ):
+            result = cpa_xai.mint_and_export(
+                email="consent-404@example.com",
+                password="secret",
+                auth_dir="auth-dir",
+                sso="sso-cookie",
+                probe=False,
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertTrue(result.get("skipped_device"))
+        self.assertIn("consent HTTP 404", result["error"])
+        self.assertIn("consent HTTP 404", result["auth_code_error"] or "")
+        protocol_mint.assert_not_called()
+        browser_mint.assert_not_called()
+
+    def test_invalid_auth_code_referrer_falls_back_when_device_allowed(self):
         expected_path = Path("/tmp/xai-auth-code-fallback@example.com.json")
         with (
             patch.object(
@@ -336,6 +410,7 @@ class MintHealthGateTests(unittest.TestCase):
                 password="secret",
                 auth_dir="auth-dir",
                 sso="sso-cookie",
+                skip_device_when_referrer_required=False,
                 probe=False,
             )
 
@@ -343,6 +418,39 @@ class MintHealthGateTests(unittest.TestCase):
         self.assertEqual(result["mint_method"], "protocol")
         self.assertIn("referrer", result["auth_code_error"])
         auth_code_mint.assert_called_once()
+        protocol_mint.assert_called_once()
+
+    def test_empty_referrer_policy_allows_device_after_auth_code_fail(self):
+        expected_path = Path("/tmp/xai-empty-referrer@example.com.json")
+        with (
+            patch.object(
+                mint_module,
+                "mint_with_sso_auth_code",
+                side_effect=mint_module.AuthCodeMintError("consent failed"),
+            ),
+            patch.object(
+                mint_module,
+                "mint_with_sso_protocol",
+                return_value={
+                    "access_token": "protocol-access",
+                    "refresh_token": "protocol-refresh",
+                    "expires_in": 3600,
+                    "mint_method": "protocol",
+                },
+            ) as protocol_mint,
+            patch.object(mint_module, "write_cpa_xai_auth", return_value=expected_path),
+        ):
+            result = cpa_xai.mint_and_export(
+                email="empty-policy@example.com",
+                password="secret",
+                auth_dir="auth-dir",
+                sso="sso-cookie",
+                required_referrer="",
+                probe=False,
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["mint_method"], "protocol")
         protocol_mint.assert_called_once()
 
     def test_invalid_referrer_is_rejected_without_health_or_write(self):
@@ -375,6 +483,7 @@ class MintHealthGateTests(unittest.TestCase):
                 auth_dir="auth-dir",
                 sso="sso-cookie",
                 prefer_auth_code=False,
+                skip_device_when_referrer_required=False,
                 health_check=True,
                 probe=False,
             )
@@ -479,33 +588,187 @@ class FinalizeCandidateHealthGateTests(unittest.TestCase):
             mark_used.assert_not_called()
             add_to_pool.assert_not_called()
 
-    def test_unknown_and_healthy_candidates_are_written_and_marked_used(self):
-        for classification in ("unknown", "healthy"):
-            with self.subTest(classification=classification), tempfile.TemporaryDirectory() as tempdir:
-                accounts_path = Path(tempdir) / "accounts.txt"
-                email = f"{classification}@example.com"
-                job = self._job(email)
-                with (
-                    patch.object(register_cli, "log"),
-                    patch.object(register_cli.reg, "mark_error") as mark_error,
-                    patch.object(register_cli.reg, "mark_used") as mark_used,
-                    patch.object(register_cli.reg, "add_token_to_grok2api_pools") as add_to_pool,
-                ):
-                    outcome = register_cli._finalize_candidate(
-                        1,
-                        job,
-                        {"ok": True, "health": {"classification": classification}},
-                        str(accounts_path),
-                    )
-
-                self.assertEqual(outcome, "accepted")
-                self.assertEqual(
-                    accounts_path.read_text(encoding="utf-8"),
-                    f"{email}----secret----sso-cookie\n",
+    def test_healthy_with_cpa_path_is_accepted(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            accounts_path = Path(tempdir) / "accounts.txt"
+            email = "healthy@example.com"
+            job = self._job(email)
+            with (
+                patch.object(register_cli, "log"),
+                patch.object(register_cli.reg, "mark_error") as mark_error,
+                patch.object(register_cli.reg, "mark_used") as mark_used,
+                patch.object(register_cli.reg, "add_token_to_grok2api_pools") as add_to_pool,
+            ):
+                outcome = register_cli._finalize_candidate(
+                    1,
+                    job,
+                    {
+                        "ok": True,
+                        "path": "/tmp/xai-healthy@example.com.json",
+                        "health": {"classification": "healthy"},
+                    },
+                    str(accounts_path),
+                    require_cpa_file=True,
+                    require_healthy=True,
                 )
-                mark_error.assert_not_called()
-                mark_used.assert_called_once_with(email, "secret")
-                add_to_pool.assert_called_once()
+
+            self.assertEqual(outcome, "accepted")
+            self.assertEqual(
+                accounts_path.read_text(encoding="utf-8"),
+                f"{email}----secret----sso-cookie\n",
+            )
+            mark_error.assert_not_called()
+            mark_used.assert_called_once_with(email, "secret")
+            add_to_pool.assert_called_once()
+
+    def test_unknown_without_path_is_not_accepted_under_strict_policy(self):
+        """Mint failed → no health → used to fake 'unknown success'; must fail now."""
+        with tempfile.TemporaryDirectory() as tempdir:
+            accounts_path = Path(tempdir) / "accounts.txt"
+            job = self._job("ghost@example.com")
+            with (
+                patch.object(register_cli, "log"),
+                patch.object(register_cli.reg, "mark_error") as mark_error,
+                patch.object(register_cli.reg, "mark_used") as mark_used,
+                patch.object(register_cli.reg, "add_token_to_grok2api_pools") as add_to_pool,
+            ):
+                outcome = register_cli._finalize_candidate(
+                    1,
+                    job,
+                    {
+                        "ok": False,
+                        "error": "auth_code failed",
+                        "auth_code_error": "consent HTTP 404",
+                    },
+                    str(accounts_path),
+                    require_cpa_file=True,
+                    require_healthy=True,
+                )
+
+            self.assertEqual(outcome, "failed")
+            self.assertFalse(accounts_path.exists())
+            mark_error.assert_called_once()
+            mark_used.assert_not_called()
+            add_to_pool.assert_not_called()
+
+    def test_unknown_classification_with_path_rejected_when_healthy_required(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            accounts_path = Path(tempdir) / "accounts.txt"
+            job = self._job("soft@example.com")
+            with (
+                patch.object(register_cli, "log"),
+                patch.object(register_cli.reg, "mark_error") as mark_error,
+                patch.object(register_cli.reg, "mark_used") as mark_used,
+                patch.object(register_cli.reg, "add_token_to_grok2api_pools") as add_to_pool,
+            ):
+                outcome = register_cli._finalize_candidate(
+                    1,
+                    job,
+                    {
+                        "ok": True,
+                        "path": "/tmp/xai-soft@example.com.json",
+                        "health": {"classification": "unknown"},
+                    },
+                    str(accounts_path),
+                    require_cpa_file=True,
+                    require_healthy=True,
+                )
+
+            self.assertEqual(outcome, "failed")
+            self.assertFalse(accounts_path.exists())
+            mark_error.assert_called_once()
+            mark_used.assert_not_called()
+            add_to_pool.assert_not_called()
+
+    def test_legacy_soft_policy_can_keep_unknown_with_path(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            accounts_path = Path(tempdir) / "accounts.txt"
+            job = self._job("legacy@example.com")
+            with (
+                patch.object(register_cli, "log"),
+                patch.object(register_cli.reg, "mark_error") as mark_error,
+                patch.object(register_cli.reg, "mark_used") as mark_used,
+                patch.object(register_cli.reg, "add_token_to_grok2api_pools") as add_to_pool,
+            ):
+                outcome = register_cli._finalize_candidate(
+                    1,
+                    job,
+                    {
+                        "ok": True,
+                        "path": "/tmp/xai-legacy@example.com.json",
+                        "health": {"classification": "unknown"},
+                    },
+                    str(accounts_path),
+                    require_cpa_file=True,
+                    require_healthy=False,
+                )
+
+            self.assertEqual(outcome, "accepted")
+            self.assertTrue(accounts_path.exists())
+            mark_error.assert_not_called()
+            mark_used.assert_called_once()
+            add_to_pool.assert_called_once()
+
+    def test_mint_required_blocks_account_write_on_mint_fail(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            accounts_path = Path(tempdir) / "accounts.txt"
+            job = self._job("mint-fail@example.com")
+            with (
+                patch.object(register_cli, "log"),
+                patch.object(register_cli.reg, "mark_error") as mark_error,
+                patch.object(register_cli.reg, "mark_used") as mark_used,
+                patch.object(register_cli.reg, "add_token_to_grok2api_pools") as add_to_pool,
+            ):
+                outcome = register_cli._finalize_candidate(
+                    1,
+                    job,
+                    {
+                        "ok": False,
+                        "error": "auth_code failed and device flows cannot satisfy",
+                        "auth_code_error": "consent HTTP 404",
+                        "skipped_device": True,
+                    },
+                    str(accounts_path),
+                    mint_required=True,
+                    require_cpa_file=False,
+                    require_healthy=False,
+                )
+
+            self.assertEqual(outcome, "failed")
+            self.assertFalse(accounts_path.exists())
+            mark_error.assert_called_once()
+            mark_used.assert_not_called()
+            add_to_pool.assert_not_called()
+
+    def test_mint_fail_still_writes_only_when_policy_fully_relaxed(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            accounts_path = Path(tempdir) / "accounts.txt"
+            job = self._job("mint-soft@example.com")
+            with (
+                patch.object(register_cli, "log"),
+                patch.object(register_cli.reg, "mark_error") as mark_error,
+                patch.object(register_cli.reg, "mark_used") as mark_used,
+                patch.object(register_cli.reg, "add_token_to_grok2api_pools") as add_to_pool,
+            ):
+                outcome = register_cli._finalize_candidate(
+                    1,
+                    job,
+                    {
+                        "ok": False,
+                        "error": "auth_code failed",
+                        "auth_code_error": "consent HTTP 404",
+                    },
+                    str(accounts_path),
+                    mint_required=False,
+                    require_cpa_file=False,
+                    require_healthy=False,
+                )
+
+            self.assertEqual(outcome, "accepted")
+            self.assertTrue(accounts_path.exists())
+            mark_error.assert_not_called()
+            mark_used.assert_called_once()
+            add_to_pool.assert_called_once()
 
 
 class WebActivationReplacementTests(unittest.TestCase):

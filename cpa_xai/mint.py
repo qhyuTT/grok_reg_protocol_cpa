@@ -98,10 +98,18 @@ def _referrer_policy_error(
     tokens["referrer"] = actual
     if required_referrer and actual != required_referrer:
         return (
-            f"{method} token referrer={actual!r}; "
+            f"policy reject: {method} token referrer={actual!r}; "
             f"expected {required_referrer!r}"
         )
     return None
+
+
+def _device_paths_doomed(
+    pipeline_referrer: str,
+    skip_device_when_referrer_required: bool,
+) -> bool:
+    """Device-code grants cannot inject JWT referrer; skip them under policy."""
+    return bool(pipeline_referrer) and bool(skip_device_when_referrer_required)
 
 
 def mint_and_export(
@@ -128,6 +136,8 @@ def mint_and_export(
     auth_code_timeout_sec: float = 90.0,
     auth_code_require_referrer: bool = True,
     required_referrer: str | None = None,
+    skip_device_when_referrer_required: bool = True,
+    auth_code_dump_consent_dir: str | None = None,
     health_check: bool = False,
     health_probe_delays: list[float] | tuple[float, ...] = (10, 20, 45),
     health_reject_inconclusive: bool = True,
@@ -142,11 +152,18 @@ def mint_and_export(
       2) Device-code protocol HTTP if prefer_protocol
       3) Browser device consent (unless protocol_only)
 
+    When ``required_referrer`` is non-empty and
+    ``skip_device_when_referrer_required`` is true (default), device-code paths
+    are skipped after auth-code failure — they cannot stamp the claim.
+
     Returns dict with keys: ok, path, email, probe, error?, mint_method?
     """
     log = log or _noop
     pipeline_referrer = _resolve_required_referrer(
         required_referrer, auth_code_require_referrer
+    )
+    device_doomed = _device_paths_doomed(
+        pipeline_referrer, skip_device_when_referrer_required
     )
     email = (email or "").strip()
     if not email or not password:
@@ -160,7 +177,11 @@ def mint_and_export(
     # Thread-local pin — safe under concurrent mint workers.
     resolved = resolve_proxy(proxy)
     set_runtime_proxy(resolved or None)
-    log(f"mint start: {email} proxy={proxy_log_label(resolved) or '(none)'}")
+    log(
+        f"mint start: {email} proxy={proxy_log_label(resolved) or '(none)'} "
+        f"referrer_policy={pipeline_referrer or '(off)'} "
+        f"skip_device={device_doomed}"
+    )
 
     sso_val = (sso or "").strip() or extract_sso_from_cookies(cookies)
     tokens: dict[str, Any] | None = None
@@ -177,6 +198,7 @@ def mint_and_export(
                 total_timeout_sec=auth_code_timeout_sec,
                 require_referrer=False,
                 required_referrer="",
+                dump_consent_dir=auth_code_dump_consent_dir,
                 log=log,
                 cancel=cancel,
             )
@@ -202,6 +224,38 @@ def mint_and_export(
                 return {"ok": False, "email": email, "error": "cancelled"}
     elif prefer_auth_code and not sso_val:
         log("mint auth-code skipped (no sso cookie)")
+
+    if tokens is None and device_doomed:
+        if auth_code_err:
+            abort_err = (
+                f"auth_code failed and device flows cannot satisfy "
+                f"referrer={pipeline_referrer!r}: {auth_code_err}"
+            )
+        elif prefer_auth_code and not sso_val:
+            abort_err = (
+                f"auth-code skipped (no sso) and device flows cannot satisfy "
+                f"referrer={pipeline_referrer!r}"
+            )
+        elif not prefer_auth_code:
+            abort_err = (
+                f"auth-code disabled and device flows cannot satisfy "
+                f"referrer={pipeline_referrer!r}; "
+                f"enable cpa_prefer_auth_code or clear cpa_required_referrer "
+                f"(or set cpa_skip_device_when_referrer_required=false)"
+            )
+        else:
+            abort_err = (
+                f"device flows cannot satisfy referrer={pipeline_referrer!r}"
+            )
+        log(f"mint abort: {abort_err}")
+        return {
+            "ok": False,
+            "email": email,
+            "error": abort_err,
+            "auth_code_error": auth_code_err,
+            "mint_method": "auth_code" if prefer_auth_code else None,
+            "skipped_device": True,
+        }
 
     if tokens is None and prefer_protocol and sso_val:
         log("mint try protocol (SSO HTTP device flow)")
@@ -235,8 +289,16 @@ def mint_and_export(
                     "error": f"protocol_only: {e}",
                     "mint_method": "protocol",
                     "auth_code_error": auth_code_err,
+                    "protocol_error": protocol_err,
                 }
-            log("mint fallback → browser")
+            log(
+                "mint fallback → browser"
+                + (
+                    f" (auth_code: {auth_code_err})"
+                    if auth_code_err
+                    else ""
+                )
+            )
         except Exception as e:  # noqa: BLE001
             protocol_err = str(e)
             tokens = None
@@ -248,8 +310,16 @@ def mint_and_export(
                     "error": f"protocol_only: {e}",
                     "mint_method": "protocol",
                     "auth_code_error": auth_code_err,
+                    "protocol_error": protocol_err,
                 }
-            log("mint fallback → browser")
+            log(
+                "mint fallback → browser"
+                + (
+                    f" (auth_code: {auth_code_err})"
+                    if auth_code_err
+                    else ""
+                )
+            )
     elif tokens is None and prefer_protocol and not sso_val:
         log("mint protocol skipped (no sso cookie) → browser")
         if protocol_only:
@@ -315,11 +385,16 @@ def mint_and_export(
                 tokens["auth_code_error"] = auth_code_err
         except Exception as e:  # noqa: BLE001
             log(f"mint failed: {e}")
-            err = str(e)
-            if protocol_err:
-                err = f"{err} (protocol: {protocol_err})"
+            # Prefer auth_code as primary when present — it is the only path
+            # that can stamp referrer under default policy.
             if auth_code_err:
-                err = f"{err} (auth_code: {auth_code_err})"
+                err = f"{auth_code_err} (browser: {e})"
+                if protocol_err:
+                    err = f"{err} (protocol: {protocol_err})"
+            else:
+                err = str(e)
+                if protocol_err:
+                    err = f"{err} (protocol: {protocol_err})"
             return {
                 "ok": False,
                 "email": email,

@@ -267,8 +267,9 @@ def mint_with_sso_protocol(
         raise ProtocolMintError(f"token poll: {e}") from e
 
     log(
-        f"protocol token ok expires_in={tr.expires_in}"
+        f"protocol token polled expires_in={tr.expires_in}"
         + (f" email={email}" if email else "")
+        + " referrer=(none for device-code)"
     )
     return {
         "access_token": tr.access_token,

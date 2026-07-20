@@ -360,10 +360,14 @@ def register_one(
             log_callback=lambda m: log(worker_id, m),
             cancel_callback=cancel,
         )
+        reg.record_web_activation_audit(
+            email, activation, log_callback=lambda m: log(worker_id, m)
+        )
         if not activation.get("ok"):
             reason = str(activation.get("reason") or "web_activation_failed")
             detail = (
                 f"web_activation:{reason}:"
+                f"stage={activation.get('stage', 'unknown')}:"
                 f"session={activation.get('auth_session_status', 0)}:"
                 f"settings={activation.get('user_settings_status', 0)}:"
                 f"dom={activation.get('dom_state', 'unknown')}"
@@ -482,7 +486,20 @@ def _run_mint_job(worker_id: int | str, job: dict[str, Any], config: dict) -> di
             log(worker_id, f"[cpa] skipped: {result.get('reason')}")
         else:
             _inc("mint_fail")
-            log(worker_id, f"! CPA auth 未成功: {result.get('error') or result}")
+            primary = (
+                result.get("auth_code_error")
+                or result.get("error")
+                or result
+            )
+            log(
+                worker_id,
+                f"! CPA auth 未成功: {primary}"
+                + (
+                    " (device paths skipped under referrer policy)"
+                    if result.get("skipped_device")
+                    else ""
+                ),
+            )
         return result
     except Exception as exc:
         _inc("mint_fail")
@@ -491,16 +508,46 @@ def _run_mint_job(worker_id: int | str, job: dict[str, Any], config: dict) -> di
         return {"ok": False, "error": str(exc), "email": email}
 
 
+def _success_policy_from_config(cfg: dict | None) -> tuple[bool, bool]:
+    """Return (require_cpa_file, require_healthy) for registration commit."""
+    cfg = cfg or {}
+    # Defaults are strict: 入库 (xai-*.json) + healthy probe = success.
+    require_file = bool(cfg.get("registration_success_requires_cpa_file", True))
+    require_healthy = bool(cfg.get("registration_success_requires_healthy", True))
+    return require_file, require_healthy
+
+
 def _finalize_candidate(
     worker_id: int | str,
     job: dict[str, Any],
     mint_result: dict[str, Any],
     accounts_file: str,
+    *,
+    mint_required: bool = False,
+    require_cpa_file: bool | None = None,
+    require_healthy: bool | None = None,
 ) -> str:
-    """Commit a candidate only after the health gate has made its decision."""
+    """Commit a candidate only when CPA 入库 criteria are met.
+
+    Default product rule (入库才算成功):
+      - not health-rejected
+      - real CPA auth file path present (xai-*.json written)
+      - health.classification == healthy
+    """
     email = str(job.get("email") or "")
     password = str(job.get("password") or "")
     sso = str(job.get("sso") or "")
+    cfg = getattr(reg, "config", {}) or {}
+    if require_cpa_file is None or require_healthy is None:
+        pol_file, pol_healthy = _success_policy_from_config(cfg)
+        if require_cpa_file is None:
+            require_cpa_file = pol_file
+        if require_healthy is None:
+            require_healthy = pol_healthy
+    # Legacy: cpa_mint_required implies file requirement.
+    if mint_required:
+        require_cpa_file = True
+
     if mint_result.get("rejected"):
         _inc("health_rejected")
         rejection_summary = str(
@@ -515,11 +562,77 @@ def _finalize_candidate(
         log(worker_id, f"[-] 健康门淘汰候选且不落盘: {email} ({rejection_summary})")
         return "rejected"
 
+    mint_ok = bool(mint_result.get("ok"))
+    mint_skipped = bool(mint_result.get("skipped"))
+    cpa_path = str(
+        mint_result.get("path") or mint_result.get("cpa_path") or ""
+    ).strip()
     health = mint_result.get("health") if isinstance(mint_result, dict) else None
-    classification = health.get("classification") if isinstance(health, dict) else "unknown"
-    if classification != "healthy":
+    if isinstance(health, dict) and health.get("classification"):
+        classification = str(health.get("classification") or "").strip() or "unknown"
+        health_present = True
+    else:
+        # No health block: mint never reached the probe (fail/skip) — not "unknown soft ok".
+        classification = "missing"
+        health_present = False
+
+    def _reject_commit(reason: str, *, counter: str = "reg_fail") -> str:
+        try:
+            reg.mark_error(email, password, reason=reason[:240])
+        except Exception:
+            pass
+        _inc(counter)
+        log(worker_id, f"[-] 未入库，不记注册成功: {email} ({reason})")
+        return "failed"
+
+    # Explicit mint_required soft-fail (also covered by path gate when require_cpa_file).
+    if (
+        mint_required
+        and not mint_ok
+        and not mint_skipped
+        and not mint_result.get("rejected")
+    ):
+        reason = str(
+            mint_result.get("auth_code_error")
+            or mint_result.get("error")
+            or "cpa_mint_required"
+        )[:240]
+        return _reject_commit(f"cpa_mint_required:{reason}")
+
+    if require_cpa_file and not mint_skipped and not cpa_path:
+        detail = str(
+            mint_result.get("auth_code_error")
+            or mint_result.get("error")
+            or ("mint_ok_without_path" if mint_ok else "mint_failed")
+        )[:200]
+        return _reject_commit(f"no_cpa_file:{detail}")
+
+    if require_healthy and not mint_skipped:
+        if not health_present or classification != "healthy":
+            detail = classification if health_present else "health_missing"
+            if not mint_ok:
+                detail = (
+                    f"{detail}:"
+                    f"{mint_result.get('auth_code_error') or mint_result.get('error') or 'mint_failed'}"
+                )[:200]
+            return _reject_commit(
+                f"health_not_healthy:{detail}", counter="health_unknown"
+            )
+
+    # Soft / legacy mode only: keep non-healthy when policy allows.
+    if classification != "healthy" and not mint_skipped:
         _inc("health_unknown")
-        log(worker_id, f"[health] 非明确权限拒绝，按配置保留: {email} ({classification})")
+        log(
+            worker_id,
+            f"[health] 非 healthy，按宽松策略保留: {email} ({classification})",
+        )
+
+    if not mint_ok and not mint_skipped and not require_cpa_file:
+        log(
+            worker_id,
+            f"[*] 宽松策略：CPA 未写出仍落盘 SSO: {email}: "
+            f"{mint_result.get('auth_code_error') or mint_result.get('error') or 'mint_failed'}",
+        )
 
     line = f"{email}----{password}----{sso}\n"
     with _accounts_lock:
@@ -541,10 +654,12 @@ def _finalize_candidate(
     except Exception as exc:
         log(worker_id, f"[Debug] grok2api: {exc}")
     _inc("reg_success")
+    if cpa_path:
+        log(worker_id, f"[+] 入库成功 path={cpa_path}")
     if classification == "healthy":
         log(worker_id, f"[+] 注册成功并通过健康门: {email}")
     else:
-        log(worker_id, f"[+] 注册成功，健康结果按策略保留: {email} ({classification})")
+        log(worker_id, f"[+] 注册成功（宽松策略）: {email} ({classification})")
     return "accepted"
 
 
@@ -566,9 +681,21 @@ def _safe_finalize_candidate(
     job: dict[str, Any],
     mint_result: dict[str, Any],
     accounts_file: str,
+    *,
+    mint_required: bool = False,
+    require_cpa_file: bool | None = None,
+    require_healthy: bool | None = None,
 ) -> str:
     try:
-        return _finalize_candidate(worker_id, job, mint_result, accounts_file)
+        return _finalize_candidate(
+            worker_id,
+            job,
+            mint_result,
+            accounts_file,
+            mint_required=mint_required,
+            require_cpa_file=require_cpa_file,
+            require_healthy=require_healthy,
+        )
     except Exception as exc:
         _inc("reg_fail")
         log(worker_id, f"! 候选提交失败: {exc}")
@@ -713,7 +840,13 @@ def _register_worker(
                         terminal_status = "failed"
                     else:
                         terminal_status = _safe_finalize_candidate(
-                            f"R{worker_id}", candidate, mint_result, accounts_file
+                            f"R{worker_id}",
+                            candidate,
+                            mint_result,
+                            accounts_file,
+                            mint_required=bool(
+                                mint_cfg.get("cpa_mint_required", False)
+                            ),
                         )
                 elif mint_queue is not None:
                     qmax = int(getattr(mint_queue, "_reg_qmax", 0) or 0)
@@ -779,6 +912,9 @@ def _mint_worker(worker_id: str, mint_queue: queue.Queue, config: dict):
                     job,
                     result,
                     str(job.get("accounts_file") or "accounts_cli.txt"),
+                    mint_required=bool(
+                        (config or {}).get("cpa_mint_required", False)
+                    ),
                 )
             _emit_outcome(job.get("outcome_queue"), job, status)
         finally:

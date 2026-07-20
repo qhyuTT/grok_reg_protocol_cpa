@@ -19,6 +19,7 @@ import random
 import re
 import string
 import json
+import urllib.parse
 
 from DrissionPage import Chromium, ChromiumOptions
 from DrissionPage.common import Keys
@@ -61,10 +62,19 @@ DEFAULT_CONFIG = {
     "registration_health_probe_delays_sec": [10, 20, 45],
     "registration_health_reject_inconclusive": True,
     "registration_health_audit_file": "cpa_auths/registration_health_audit.jsonl",
+    # 入库才算成功: 需要写出 xai-*.json 且 health=healthy（可关开关回退宽松）
+    "registration_success_requires_cpa_file": True,
+    "registration_success_requires_healthy": True,
     "registration_post_activation_settle_sec": 5,
+    "registration_web_activation_audit_file": "cpa_auths/web_activation_audit.jsonl",
     "registration_behavior_trace_enabled": False,
     "registration_behavior_trace_dir": "manual_registration_traces",
     "registration_behavior_trace_page_interval_sec": 1.0,
+    "sso_timeout_base": 240,
+    "sso_timeout_max": 480,
+    "sso_progress_extension": 120,
+    "sso_force_grok_nav_after_sec": 12,
+    "sso_force_grok_nav_settle_sec": 5,
     "hotmail_accounts_file": "mail_credentials.txt",
     "hotmail_alias_mode": "random",
     "hotmail_alias_random_length": 8,
@@ -104,6 +114,11 @@ DEFAULT_CONFIG = {
     "proxy_rotation_switch_confirm_interval_sec": 0.2,
     "proxy_rotation_controller_timeout_sec": 5,
     "proxy_rotation_probe_timeout_sec": 10,
+    "proxy_rotation_preflight_enabled": True,
+    "proxy_rotation_preflight_url": "https://www.gstatic.com/generate_204",
+    "proxy_rotation_preflight_timeout_ms": 5000,
+    "proxy_rotation_preflight_max_delay_ms": 2000,
+    "proxy_rotation_preflight_cache_sec": 60,
     "proxy_rotation_max_switch_attempts": 8,
     "proxy_rotation_max_wait_sec": 600,
     "proxy_rotation_cooldown_healthy_sec": 360,
@@ -111,7 +126,7 @@ DEFAULT_CONFIG = {
     "proxy_rotation_cooldown_soft_sec": 180,
     "proxy_rotation_cooldown_forbidden_unknown_sec": 180,
     "proxy_rotation_cooldown_fail_sec": 60,
-    "proxy_rotation_cooldown_activation_failed_sec": 120,
+    "proxy_rotation_cooldown_activation_failed_sec": 900,
     "proxy_rotation_cooldown_egress_denied_sec": 1800,
     "proxy_rotation_egress_denied_breaker_threshold": 2,
     "proxy_rotation_bad_geo_cooldown_sec": 3600,
@@ -126,6 +141,7 @@ _cf_domain_index = 0
 _cloudmail_public_token = None
 _cloudmail_public_token_lock = threading.Lock()
 _cpa_gui_export_lock = threading.Lock()
+_web_activation_audit_lock = threading.Lock()
 _hotmail_accounts_cache = None
 _hotmail_accounts_mtime = None
 _hotmail_accounts_lock = threading.Lock()
@@ -733,6 +749,7 @@ CHROMIUM_SLIM_FLAGS = [
     "--mute-audio",
     "--disable-background-networking",
     "--no-first-run",
+    "--window-size=1280,900",
 ]
 
 
@@ -3300,11 +3317,24 @@ GROK_CHAT_INPUT_SELECTORS = (
     'textarea[aria-label="向 Grok 提任何问题"]',
     '[data-testid="chat-input"]',
 )
+GROK_CHAT_SEND_BUTTON_SELECTORS = (
+    'button[aria-label="Send"]',
+    'button[aria-label="发送"]',
+    'button[aria-label*="Send" i]',
+    '[data-testid="send-button"]',
+    '[data-testid="chat-send-button"]',
+)
 GROK_BIRTH_INPUT_SELECTORS = (
     'input[aria-label="出生年份"]',
     'input[aria-label="Birth year"]',
+    '[role="dialog"] input[autocomplete="bday-year"]',
+    '[aria-modal="true"] input[autocomplete="bday-year"]',
+    '[role="dialog"] input[name*="birth" i]',
+    '[aria-modal="true"] input[name*="birth" i]',
     '[role="dialog"] input[inputmode="numeric"]',
+    '[aria-modal="true"] input[inputmode="numeric"]',
     '[role="dialog"] input[type="number"]',
+    '[aria-modal="true"] input[type="number"]',
 )
 GROK_BIRTH_BUTTON_WORDS = (
     "保存",
@@ -3318,23 +3348,371 @@ GROK_BIRTH_BUTTON_WORDS = (
 )
 
 
+def _activation_element_ready(element):
+    if element is None:
+        return False
+    try:
+        states = getattr(element, "states", None)
+        if states is None:
+            return True
+        if not states.is_displayed:
+            return False
+        if hasattr(states, "is_enabled") and not states.is_enabled:
+            return False
+        if hasattr(states, "has_rect") and not states.has_rect:
+            return False
+        return True
+    except Exception:
+        return False
+
+
 def _activation_find_element(page, selectors, timeout=0.15):
     """Return the first visible/enabled element matching the selector list."""
     for selector in selectors:
         try:
             element = page.ele(f"css:{selector}", timeout=timeout)
-            if not element:
-                continue
-            states = getattr(element, "states", None)
-            if states is not None:
-                if not states.is_displayed:
-                    continue
-                if hasattr(states, "is_enabled") and not states.is_enabled:
-                    continue
-            return element, selector
+            if _activation_element_ready(element):
+                return element, selector
         except Exception:
             continue
     return None, None
+
+
+_LAST_SSO_WAIT_META: dict = {}
+
+
+def _activation_chat_ready(page) -> bool:
+    element, _ = _activation_find_element(page, GROK_CHAT_INPUT_SELECTORS, timeout=0.2)
+    return element is not None
+
+
+def _activation_click_reload_if_present(page, log=None) -> bool:
+    """Click Grok/CF-style reload buttons if the error shell is showing."""
+    if page is None:
+        return False
+    candidates = (
+        "text:重新加载",
+        "text:Reload",
+        "text:reload",
+        'css:button[aria-label*="Reload" i]',
+        'css:button[aria-label*="重新加载"]',
+    )
+    for locator in candidates:
+        try:
+            btn = page.ele(locator, timeout=0.25)
+            if btn is None:
+                continue
+            try:
+                btn.click()
+            except Exception:
+                run_js = getattr(btn, "run_js", None)
+                if callable(run_js):
+                    run_js("this.click();")
+                else:
+                    continue
+            if log:
+                log("[activation] 检测到错误页，已点击重新加载")
+            return True
+        except Exception:
+            continue
+    return False
+
+
+def _wait_page_doc_loaded(page, timeout: float = 15.0) -> bool:
+    if page is None:
+        return False
+    try:
+        wait = getattr(page, "wait", None)
+        if wait is not None and hasattr(wait, "doc_loaded"):
+            wait.doc_loaded(timeout=timeout)
+            return True
+    except Exception:
+        pass
+    sleep_with_cancel(min(2.0, max(0.5, float(timeout) / 5.0)))
+    return False
+
+
+def _hydrate_after_force_nav(
+    page,
+    *,
+    log_callback=None,
+    cancel_callback=None,
+    settle_sec: float = 5.0,
+    ready_timeout: float = 25.0,
+) -> dict:
+    """After force-nav to grok.com, wait for SPA hydration before activation."""
+    meta = {"hydrated": False, "reloads": 0, "chat_ready": False, "session_ready": False}
+    if page is None:
+        return meta
+    _wait_page_doc_loaded(page, timeout=15.0)
+    sleep_with_cancel(max(0.0, float(settle_sec)), cancel_callback)
+    deadline = time.time() + max(5.0, float(ready_timeout))
+    reloaded = False
+    while time.time() < deadline:
+        raise_if_cancelled(cancel_callback)
+        if not _activation_url_is_grok(getattr(page, "url", "")):
+            break
+        if _activation_click_reload_if_present(page, log_callback):
+            meta["reloads"] += 1
+            sleep_with_cancel(2.0, cancel_callback)
+        chat_ok = _activation_chat_ready(page)
+        probe = _activation_session_probe(page)
+        session_ok = (
+            200 <= int(probe.get("auth_session_status") or 0) < 300
+            and 200 <= int(probe.get("user_settings_status") or 0) < 300
+            and bool(probe.get("session_nonempty"))
+        )
+        meta["chat_ready"] = chat_ok
+        meta["session_ready"] = session_ok
+        if chat_ok or session_ok:
+            meta["hydrated"] = True
+            if log_callback:
+                log_callback(
+                    "[*] force-nav hydrated "
+                    f"session={probe.get('auth_session_status')}/"
+                    f"{probe.get('user_settings_status')} "
+                    f"chat={'yes' if chat_ok else 'no'}"
+                )
+            return meta
+        # One soft reload if still empty after a few seconds.
+        elapsed = max(0.0, float(ready_timeout) - max(0.0, deadline - time.time()))
+        if (not reloaded) and elapsed >= 8.0:
+            reloaded = True
+            meta["reloads"] += 1
+            try:
+                if log_callback:
+                    log_callback("[*] force-nav shell empty, soft reload grok.com")
+                page.get("https://grok.com/")
+                _wait_page_doc_loaded(page, timeout=12.0)
+                sleep_with_cancel(2.0, cancel_callback)
+            except Exception as exc:
+                if log_callback:
+                    log_callback(f"[Debug] force-nav soft reload failed: {exc}")
+        sleep_with_cancel(0.5, cancel_callback)
+    if log_callback:
+        log_callback(
+            "[*] force-nav hydrate timeout "
+            f"(session_ready={meta['session_ready']} chat_ready={meta['chat_ready']})"
+        )
+    return meta
+
+
+def _activation_element_attr(element, name):
+    for accessor in ("property", "attr"):
+        method = getattr(element, accessor, None)
+        if callable(method):
+            try:
+                value = method(name)
+                if value is not None:
+                    return str(value)
+            except Exception:
+                pass
+    try:
+        value = getattr(element, name)
+        return None if value is None else str(value)
+    except Exception:
+        return None
+
+
+def _activation_live_value(element):
+    """Read the live control value, not the initial HTML value attribute."""
+    run_js = getattr(element, "run_js", None)
+    if callable(run_js):
+        try:
+            value = run_js(
+                "return this.value !== undefined ? this.value : "
+                "(this.innerText || this.textContent || '');"
+            )
+            if value is not None:
+                return str(value)
+        except Exception:
+            pass
+    for accessor in ("property", "attr"):
+        method = getattr(element, accessor, None)
+        if callable(method):
+            try:
+                value = method("value")
+                if value is not None:
+                    return str(value)
+            except Exception:
+                pass
+    try:
+        value = getattr(element, "value")
+        return None if value is None else str(value)
+    except Exception:
+        return None
+
+
+def _activation_find_birth_input(page):
+    element, selector = _activation_find_element(page, GROK_BIRTH_INPUT_SELECTORS)
+    if element is not None:
+        return element, selector
+
+    try:
+        inputs = page.eles(
+            'css:[role="dialog"] input, [aria-modal="true"] input', timeout=0.15
+        )
+    except Exception:
+        inputs = []
+    candidates = [item for item in (inputs or []) if _activation_element_ready(item)]
+    semantic = []
+    for item in candidates:
+        description = " ".join(
+            _activation_element_attr(item, key) or ""
+            for key in ("aria-label", "name", "placeholder", "autocomplete")
+        )
+        if re.search(r"出生|生日|birth|bday|year|年份|年龄|age", description, re.I):
+            semantic.append(item)
+    if semantic:
+        return semantic[0], "dialog_semantic_input"
+    if len(candidates) == 1:
+        input_type = (_activation_element_attr(candidates[0], "type") or "text").lower()
+        input_mode = (_activation_element_attr(candidates[0], "inputmode") or "").lower()
+        if input_type in {"text", "number", "tel"} or input_mode in {"numeric", "decimal"}:
+            return candidates[0], "dialog_unique_input"
+    return None, None
+
+
+def _activation_apply_input_value(element, value):
+    """Set React-controlled input value via native setter when possible."""
+    text = str(value)
+    run_js = getattr(element, "run_js", None)
+    if callable(run_js):
+        try:
+            applied = run_js(
+                """
+const v = String(arguments[0] ?? '');
+const el = this;
+try { el.focus(); } catch (e) {}
+const desc = Object.getOwnPropertyDescriptor(
+  window.HTMLInputElement.prototype, 'value'
+);
+const nativeSetter = desc && desc.set;
+if (nativeSetter) nativeSetter.call(el, v);
+else el.value = v;
+el.dispatchEvent(new Event('input', { bubbles: true }));
+el.dispatchEvent(new Event('change', { bubbles: true }));
+try {
+  el.dispatchEvent(new InputEvent('input', {
+    bubbles: true, data: v, inputType: 'insertText'
+  }));
+} catch (e) {}
+return String(el.value || '');
+                """,
+                text,
+            )
+            if applied is not None:
+                return str(applied)
+        except Exception:
+            pass
+    try:
+        element.input(text, clear=True)
+    except Exception:
+        try:
+            element.clear()
+            element.input(text)
+        except Exception:
+            pass
+    return _activation_live_value(element) or ""
+
+
+def _activation_fill_birth_year(page, birth_year, deadline, cancel_callback, log):
+    last_error = "birth input unavailable"
+    attempts = 0
+    year_text = str(birth_year)
+    for attempt in range(1, 4):
+        if time.time() >= deadline:
+            break
+        raise_if_cancelled(cancel_callback)
+        element, selector = _activation_find_birth_input(page)
+        if element is None:
+            last_error = "birth input unavailable"
+            sleep_with_cancel(0.3 * attempt, cancel_callback)
+            continue
+        attempts = attempt
+        try:
+            try:
+                element.click()
+            except Exception:
+                pass
+            applied = _activation_apply_input_value(element, year_text)
+            sleep_with_cancel(0.2, cancel_callback)
+            observed = _activation_live_value(element) or applied
+            digits = re.sub(r"\D", "", str(observed or ""))
+            if digits == year_text or str(observed or "").strip() == year_text:
+                return True, attempts, selector, ""
+            last_error = f"birth value not applied via {selector}"
+        except Exception as exc:
+            last_error = str(exc)[:160]
+        log(f"[activation] 生日输入重试 {attempt}/3: {last_error}")
+        sleep_with_cancel(0.3 * attempt, cancel_callback)
+    return False, attempts, "", last_error
+
+
+def _activation_submit_message(page, message, *, prefer_button=False):
+    element, selector = _activation_find_element(page, GROK_CHAT_INPUT_SELECTORS)
+    if element is None:
+        raise LookupError("chat input unavailable")
+    element.click()
+    element.input(message, clear=True)
+    button, button_selector = _activation_find_element(page, GROK_CHAT_SEND_BUTTON_SELECTORS)
+    if prefer_button and button is not None:
+        try:
+            button.click()
+            return selector, f"button:{button_selector}"
+        except Exception:
+            run_js = getattr(button, "run_js", None)
+            if callable(run_js):
+                run_js("this.scrollIntoView({block: 'center'}); this.click();")
+                return selector, f"dom-button:{button_selector}"
+    try:
+        page.actions.type(Keys.ENTER)
+        return selector, "enter"
+    except Exception:
+        if button is None:
+            raise
+        button.click()
+        return selector, f"button:{button_selector}"
+
+
+def _activation_dom_summary(page):
+    """Return control metadata only; never include input values or page text."""
+    if page is None:
+        return {}
+    try:
+        summary = page.run_js(
+            r"""
+const visible = (node) => {
+  if (!node) return false;
+  const style = getComputedStyle(node);
+  const rect = node.getBoundingClientRect();
+  return style.display !== 'none' && style.visibility !== 'hidden' &&
+    style.opacity !== '0' && rect.width > 0 && rect.height > 0;
+};
+const clean = (value) => String(value || '').replace(/\s+/g, ' ').trim().slice(0, 100);
+const describe = (node) => ({
+  tag: String(node.tagName || '').toLowerCase(),
+  type: clean(node.getAttribute && node.getAttribute('type')),
+  role: clean(node.getAttribute && node.getAttribute('role')),
+  aria_label: clean(node.getAttribute && node.getAttribute('aria-label')),
+  name: clean(node.getAttribute && node.getAttribute('name')),
+  placeholder: clean(node.getAttribute && node.getAttribute('placeholder')),
+  autocomplete: clean(node.getAttribute && node.getAttribute('autocomplete')),
+  testid: clean(node.getAttribute && node.getAttribute('data-testid')),
+  disabled: !!node.disabled,
+});
+const dialogs = [...document.querySelectorAll('[role="dialog"], [aria-modal="true"]')]
+  .filter(visible);
+const inputs = [...document.querySelectorAll('input, textarea, [contenteditable="true"], [role="textbox"]')]
+  .filter(visible).slice(0, 12).map(describe);
+const buttons = [...document.querySelectorAll('button')].filter(visible).slice(0, 16)
+  .map((node) => ({...describe(node), label: clean(node.innerText || node.textContent)}));
+return {ready_state: document.readyState, dialog_count: dialogs.length, inputs, buttons};
+"""
+        )
+        return dict(summary) if isinstance(summary, dict) else {}
+    except Exception:
+        return {}
 
 
 def _activation_conversation_url(page):
@@ -3356,8 +3734,7 @@ def _activation_pick_birth_button(page):
     visible = []
     for button in buttons or []:
         try:
-            states = button.states
-            if not states.is_displayed or not states.is_enabled:
+            if not _activation_element_ready(button):
                 continue
             visible.append(button)
             text = re.sub(r"\s+", "", str(button.text or "")).lower()
@@ -3366,6 +3743,31 @@ def _activation_pick_birth_button(page):
         except Exception:
             continue
     return visible[-1] if visible else None
+
+
+def _activation_click_birth_button(page):
+    """Re-resolve the button and use a bounded DOM fallback for stale layouts."""
+    button = _activation_pick_birth_button(page)
+    if button is None:
+        return False, False, "", "button unavailable"
+    try:
+        run_js = getattr(button, "run_js", None)
+        if callable(run_js):
+            run_js("this.scrollIntoView({block: 'center', inline: 'nearest'});")
+        button.click()
+        return True, True, "native", ""
+    except Exception as native_exc:
+        button = _activation_pick_birth_button(page)
+        if button is None:
+            return True, False, "native", str(native_exc)[:160]
+        try:
+            run_js = getattr(button, "run_js", None)
+            if not callable(run_js):
+                raise RuntimeError("DOM click unavailable")
+            run_js("this.scrollIntoView({block: 'center'}); this.click();")
+            return True, True, "dom", ""
+        except Exception as dom_exc:
+            return True, False, "dom", f"{native_exc}; {dom_exc}"[:160]
 
 
 def _activation_packet_status(packet):
@@ -3537,46 +3939,225 @@ def wait_for_authenticated_grok_page(page, log_callback=None, cancel_callback=No
         return {"ok": False, "reason": f"grok_auth_wait_exception: {exc}"}
 
 
-def activate_grok_web_account(page, log_callback=None, cancel_callback=None, timeout=120):
-    """Complete the same first-use flow a human performs on grok.com.
+def _activation_result(page, auth_result, started_at, *, ok, stage, reason="", **details):
+    auth = dict(auth_result) if isinstance(auth_result, dict) else {}
+    result = {
+        "ok": bool(ok),
+        "status": "activated" if ok else "failed",
+        "stage": stage,
+        "duration_sec": round(max(0.0, time.monotonic() - started_at), 3),
+        "auth_session_status": int(auth.get("auth_session_status") or 0),
+        "user_settings_status": int(auth.get("user_settings_status") or 0),
+        "dom_state": str(auth.get("dom_state") or _activation_auth_state(page)),
+    }
+    if reason:
+        result["reason"] = str(reason)
+    if auth:
+        result["auth"] = auth
+    if not ok:
+        result["dom_summary"] = _activation_dom_summary(page)
+    result.update(details)
+    return result
 
-    The registration browser must remain alive while this function runs.  It
-    sends one harmless message through trusted browser input, handles the
-    birthday dialog if shown, and only succeeds after the conversation is
-    created.  Expected failures are returned as ``{"ok": False, ...}`` so the
-    caller can discard the candidate before exporting cookies or minting CPA.
-    """
-    def log(message):
+
+def record_web_activation_audit(email, activation, log_callback=None):
+    """Append a compact activation result shared by GUI and CLI."""
+    raw_path = str(config.get("registration_web_activation_audit_file") or "").strip()
+    if not raw_path or not isinstance(activation, dict):
+        return
+    path = _resolve_project_path(raw_path, "cpa_auths/web_activation_audit.jsonl")
+    egress = {}
+    if config.get("proxy_rotation_enabled", False):
+        try:
+            import proxy_rotation
+
+            current = proxy_rotation.get_manager(config).current_lease_metadata()
+            if isinstance(current, dict):
+                egress = current
+        except Exception:
+            pass
+
+    def compact(value, limit=240):
+        return re.sub(r"\s+", " ", str(value or "")).strip()[:limit]
+
+    record = {
+        "timestamp": int(time.time()),
+        "email": compact(email, 160),
+        "ok": bool(activation.get("ok")),
+        "stage": compact(activation.get("stage"), 80),
+        "reason": compact(activation.get("reason")),
+        "duration_sec": activation.get("duration_sec"),
+        "auth_session_status": activation.get("auth_session_status", 0),
+        "user_settings_status": activation.get("user_settings_status", 0),
+        "dom_state": compact(activation.get("dom_state"), 40),
+        "birth_status": activation.get("birth_status"),
+        "conversation_status": activation.get("conversation_status"),
+        "birth_input_attempts": activation.get("birth_input_attempts", 0),
+        "birth_button_attempts": activation.get("birth_button_attempts", 0),
+        "message_submissions": activation.get("message_submissions", 0),
+        "message_submit_attempts": activation.get("message_submit_attempts", 0),
+        "forced_nav": bool(activation.get("forced_nav")),
+        "entry_path": compact(activation.get("entry_path"), 20),
+        "page_reloads": int(activation.get("page_reloads") or 0),
+        "conversation_429_retries": int(
+            activation.get("conversation_429_retries") or 0
+        ),
+        "dom_summary": activation.get("dom_summary") or {},
+        "clash_node": compact(egress.get("node_name"), 160),
+        "egress_country": compact(egress.get("country"), 8),
+        "proxy_lease_id": compact(egress.get("lease_id"), 80),
+    }
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with _web_activation_audit_lock:
+            with open(path, "a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+            os.chmod(path, 0o600)
         if log_callback:
-            log_callback(message)
+            log_callback(f"[activation] 脱敏审计已写入: {path}")
+    except Exception as exc:
+        if log_callback:
+            log_callback(f"[activation] 审计写入失败，主流程继续: {exc}")
+
+
+def activate_grok_web_account(
+    page,
+    log_callback=None,
+    cancel_callback=None,
+    timeout=120,
+    *,
+    forced_nav=None,
+):
+    """Complete Grok first use with bounded recovery for reactive DOM updates."""
+    started_at = time.monotonic()
+    auth_result = {}
+    listener = getattr(page, "listen", None) if page is not None else None
+    listener_started = False
+    deadline = time.time() + max(5, float(timeout))
+    message = secrets.choice(GROK_ACTIVATION_MESSAGES)
+    birth_year = None
+    birth_status = None
+    birth_saved = False
+    birth_saved_at = 0.0
+    conversation_status = None
+    birth_input_attempts = 0
+    birth_button_attempts = 0
+    message_submissions = 0
+    message_submit_attempts = 0
+    last_button_error = ""
+    page_reloads = 0
+    conversation_429_retries = 0
+    entry_meta = dict(_LAST_SSO_WAIT_META or {})
+    if forced_nav is None:
+        forced_nav = bool(entry_meta.get("forced_nav"))
+    # Force-nav cold path needs longer chat wait / one soft reload budget.
+    chat_missing_limit = 40.0 if forced_nav else 30.0
+
+    def log(message_text):
+        if log_callback:
+            log_callback(message_text)
+
+    def finish(ok, stage, reason="", **details):
+        details.setdefault("forced_nav", bool(forced_nav))
+        details.setdefault(
+            "entry_path",
+            "forced" if forced_nav else str(entry_meta.get("entry_path") or "natural"),
+        )
+        details.setdefault("page_reloads", page_reloads)
+        details.setdefault("conversation_429_retries", conversation_429_retries)
+        return _activation_result(
+            page,
+            auth_result,
+            started_at,
+            ok=ok,
+            stage=stage,
+            reason=reason,
+            birth_status=birth_status,
+            conversation_status=conversation_status,
+            birth_input_attempts=birth_input_attempts,
+            birth_button_attempts=birth_button_attempts,
+            message_submissions=message_submissions,
+            message_submit_attempts=message_submit_attempts,
+            **details,
+        )
+
+    def soft_reload_grok(reason: str) -> bool:
+        nonlocal page_reloads
+        if page is None or page_reloads >= 2:
+            return False
+        page_reloads += 1
+        try:
+            log(f"[activation] soft reload grok ({reason}) #{page_reloads}")
+            page.get("https://grok.com/")
+            _wait_page_doc_loaded(page, timeout=12.0)
+            sleep_with_cancel(2.5, cancel_callback)
+            _activation_click_reload_if_present(page, log)
+            return True
+        except Exception as exc:
+            log(f"[activation] soft reload failed: {exc}")
+            return False
+
+    def consume_packet(packet):
+        nonlocal birth_status, birth_saved, birth_saved_at, conversation_status
+        nonlocal conversation_429_retries
+        if not packet:
+            return ""
+        packet_url = _activation_packet_url(packet)
+        packet_status = _activation_packet_status(packet)
+        if "/rest/auth/set-birth-date" in packet_url:
+            birth_status = packet_status
+            if not 200 <= birth_status < 300:
+                return f"set_birth_date_http_{birth_status}"
+            birth_saved = True
+            birth_saved_at = time.time()
+            log(f"[activation] 生日保存成功 HTTP {birth_status}")
+        elif "/rest/app-chat/conversations/new" in packet_url:
+            conversation_status = packet_status
+            if not 200 <= conversation_status < 300:
+                # Soft signal for 429 so caller can backoff/resubmit instead of hard fail.
+                if int(conversation_status) == 429 and conversation_429_retries < 3:
+                    conversation_429_retries += 1
+                    log(
+                        f"[activation] conversation 429 "
+                        f"(retry {conversation_429_retries}/3), will resubmit"
+                    )
+                    return f"conversation_429_retry:{conversation_429_retries}"
+                return f"conversation_create_http_{conversation_status}"
+            log(f"[activation] 会话创建接口成功 HTTP {conversation_status}")
+        return ""
 
     if page is None:
-        return {"ok": False, "reason": "registration_page_unavailable"}
-
-    deadline = time.time() + max(5, float(timeout))
-    listener = getattr(page, "listen", None)
-    listener_started = False
-    birth_saved = False
-    birth_status = None
-    birth_year = None
-    message = secrets.choice(GROK_ACTIVATION_MESSAGES)
+        return finish(False, "page", "registration_page_unavailable")
 
     try:
         raise_if_cancelled(cancel_callback)
         if not _activation_url_is_grok(getattr(page, "url", "")):
-            return {"ok": False, "reason": "grok_natural_redirect_missing"}
+            return finish(False, "redirect", "grok_natural_redirect_missing")
 
+        auth_timeout = min(75 if forced_nav else 60, max(5, deadline - time.time()))
         auth_result = wait_for_authenticated_grok_page(
             page,
             log_callback=log_callback,
             cancel_callback=cancel_callback,
-            timeout=min(60, max(5, deadline - time.time())),
+            timeout=auth_timeout,
         )
         if not auth_result.get("ok"):
-            return auth_result
-
+            # One recovery reload for cold/error shells, then re-probe briefly.
+            if soft_reload_grok(auth_result.get("reason") or "auth_failed"):
+                auth_result = wait_for_authenticated_grok_page(
+                    page,
+                    log_callback=log_callback,
+                    cancel_callback=cancel_callback,
+                    timeout=min(40, max(5, deadline - time.time())),
+                )
+            if not auth_result.get("ok"):
+                return finish(
+                    False,
+                    "authentication",
+                    auth_result.get("reason") or "auth_failed",
+                )
         if listener is None:
-            return {"ok": False, "reason": "network_listener_unavailable"}
+            return finish(False, "listener", "network_listener_unavailable")
         try:
             listener.start(
                 targets=(
@@ -3587,142 +4168,223 @@ def activate_grok_web_account(page, log_callback=None, cancel_callback=None, tim
             )
             listener_started = True
         except Exception as exc:
-            return {"ok": False, "reason": f"network_listener_start_failed: {exc}"}
+            return finish(False, "listener", f"network_listener_start_failed: {exc}")
 
-        chat_element = None
-        chat_selector = None
-        while time.time() < deadline:
-            raise_if_cancelled(cancel_callback)
-            chat_element, chat_selector = _activation_find_element(page, GROK_CHAT_INPUT_SELECTORS)
-            if chat_element is not None:
-                break
-            sleep_with_cancel(0.25, cancel_callback)
-        if chat_element is None:
-            return {"ok": False, "reason": "chat_input_timeout"}
-
-        try:
-            chat_element.click()
-            chat_element.input(message, clear=True)
-            page.actions.type(Keys.ENTER)
-        except Exception as exc:
-            return {"ok": False, "reason": f"chat_submit_failed: {exc}"}
-        log(f"[activation] 首条消息已提交 selector={chat_selector}")
-
-        # Enter either opens the birthday modal or immediately creates a
-        # conversation for accounts that already have a birth date.
         birth_element = None
-        conversation_status = None
+        chat_missing_since = time.time()
+        chat_reload_done = False
+        next_submit_at = 0.0
+        submit_transition_deadline = 0.0
+        last_submit_error = ""
         while time.time() < deadline:
             raise_if_cancelled(cancel_callback)
-            packet = listener.wait(timeout=0.1, raise_err=False)
-            if packet:
-                packet_url = _activation_packet_url(packet)
-                packet_status = _activation_packet_status(packet)
-                if "/rest/app-chat/conversations/new" in packet_url:
-                    conversation_status = packet_status
-                    if not 200 <= conversation_status < 300:
-                        return {
-                            "ok": False,
-                            "reason": f"conversation_create_http_{conversation_status}",
-                        }
+            failure = consume_packet(listener.wait(timeout=0.1, raise_err=False))
+            if failure:
+                if failure.startswith("conversation_429_retry"):
+                    sleep_with_cancel(
+                        min(10.0, 2.0 * conversation_429_retries), cancel_callback
+                    )
+                    next_submit_at = 0.0
+                    continue
+                return finish(False, "conversation", failure)
             conversation_url = _activation_conversation_url(page)
             if conversation_url or (
                 isinstance(conversation_status, int) and 200 <= conversation_status < 300
             ):
                 log("[activation] 账号已有生日，首条消息已进入会话")
-                return {
-                    "ok": True,
-                    "status": "activated",
-                    "message": message,
-                    "birth_date_saved": False,
-                    "conversation_url": conversation_url,
-                    "conversation_status": conversation_status,
-                    "auth": auth_result,
-                }
-            birth_element, _birth_selector = _activation_find_element(
-                page, GROK_BIRTH_INPUT_SELECTORS
-            )
+                return finish(
+                    True,
+                    "complete",
+                    message=message,
+                    birth_date_saved=False,
+                    conversation_url=conversation_url,
+                )
+            birth_element, _birth_selector = _activation_find_birth_input(page)
             if birth_element is not None:
                 break
+
+            now = time.time()
+            if message_submit_attempts < 3 and now >= next_submit_at:
+                try:
+                    chat_selector, submit_mode = _activation_submit_message(
+                        page,
+                        message,
+                        prefer_button=message_submit_attempts > 0,
+                    )
+                    message_submit_attempts += 1
+                    message_submissions += 1
+                    last_submit_error = ""
+                    chat_missing_since = now
+                    next_submit_at = now + 6.0
+                    submit_transition_deadline = next_submit_at
+                    log(
+                        f"[activation] 首条消息已提交 "
+                        f"({message_submit_attempts}/3) selector={chat_selector} mode={submit_mode}"
+                    )
+                except LookupError as exc:
+                    last_submit_error = str(exc)
+                    missing_for = now - chat_missing_since
+                    if (not chat_reload_done) and missing_for >= 12.0:
+                        chat_reload_done = True
+                        if soft_reload_grok("chat_input_missing"):
+                            chat_missing_since = time.time()
+                            next_submit_at = time.time() + 1.0
+                            continue
+                    if missing_for >= chat_missing_limit:
+                        return finish(False, "message_submit", "chat_input_timeout")
+                    next_submit_at = now + 0.5
+                except Exception as exc:
+                    message_submit_attempts += 1
+                    last_submit_error = str(exc)[:160]
+                    next_submit_at = now + 1.0
+                    submit_transition_deadline = next_submit_at
+                    log(
+                        f"[activation] 首条消息提交重试 "
+                        f"{message_submit_attempts}/3: {last_submit_error}"
+                    )
+            elif (
+                message_submit_attempts >= 3
+                and submit_transition_deadline
+                and now >= submit_transition_deadline
+            ):
+                reason = (
+                    f"chat_submit_failed: {last_submit_error}"
+                    if message_submissions == 0
+                    else "message_transition_timeout"
+                )
+                return finish(False, "message_submit", reason)
             sleep_with_cancel(0.25, cancel_callback)
         if birth_element is None:
-            return {"ok": False, "reason": "birthday_dialog_timeout"}
+            reason = (
+                "message_transition_timeout"
+                if message_submissions > 0
+                else f"chat_submit_failed: {last_submit_error or 'chat unavailable'}"
+            )
+            return finish(False, "message_submit", reason)
 
         birth_year = datetime.datetime.now().year - secrets.randbelow(21) - 20
-        try:
-            birth_element.click()
-            birth_element.input(str(birth_year), clear=True)
-        except Exception as exc:
-            return {"ok": False, "reason": f"birth_year_input_failed: {exc}"}
+        input_deadline = max(deadline, time.time() + 10.0)
+        filled, birth_input_attempts, birth_selector, input_error = _activation_fill_birth_year(
+            page, birth_year, input_deadline, cancel_callback, log
+        )
+        if not filled:
+            return finish(False, "birthday_input", f"birth_year_input_failed: {input_error}")
+        log(f"[activation] 生日年份已填写 selector={birth_selector}")
 
-        clicks = 0
         last_click_at = 0.0
-        while time.time() < deadline:
+        message_resubmit_attempts = 0
+        next_resubmit_at = 0.0
+        last_resubmit_error = ""
+        save_phase_deadline = max(deadline, time.time() + 30.0)
+        resubmit_reload_done = False
+        while time.time() < save_phase_deadline:
             raise_if_cancelled(cancel_callback)
-            # Drain the targeted response without blocking the DOM polling.
-            if listener_started:
-                packet = listener.wait(timeout=0.1, raise_err=False)
-                if packet:
-                    packet_url = _activation_packet_url(packet)
-                    packet_status = _activation_packet_status(packet)
-                    if "/rest/auth/set-birth-date" in packet_url:
-                        birth_status = packet_status
-                        if not 200 <= birth_status < 300:
-                            return {
-                                "ok": False,
-                                "reason": f"set_birth_date_http_{birth_status}",
-                                "birth_status": birth_status,
-                            }
-                        birth_saved = True
-                        log(f"[activation] 生日保存成功 HTTP {birth_status}")
-                    elif "/rest/app-chat/conversations/new" in packet_url:
-                        conversation_status = packet_status
-                        if not 200 <= conversation_status < 300:
-                            return {
-                                "ok": False,
-                                "reason": f"conversation_create_http_{conversation_status}",
-                            }
-                        log(f"[activation] 会话创建接口成功 HTTP {conversation_status}")
+            failure = consume_packet(listener.wait(timeout=0.1, raise_err=False))
+            if failure:
+                if failure.startswith("conversation_429_retry"):
+                    sleep_with_cancel(
+                        min(10.0, 2.0 * max(1, conversation_429_retries)),
+                        cancel_callback,
+                    )
+                    next_resubmit_at = 0.0
+                    continue
+                stage = (
+                    "birthday_save" if failure.startswith("set_birth") else "conversation"
+                )
+                return finish(False, stage, failure)
 
             conversation_url = _activation_conversation_url(page)
             conversation_created = conversation_url or (
                 isinstance(conversation_status, int) and 200 <= conversation_status < 300
             )
             if birth_saved and conversation_created:
-                conversation_url = _activation_conversation_url(page)
                 log(f"[activation] 会话创建成功 {conversation_url}")
-                return {
-                    "ok": True,
-                    "status": "activated",
-                    "message": message,
-                    "birth_year": birth_year,
-                    "birth_date_saved": True,
-                    "birth_status": birth_status,
-                    "conversation_url": conversation_url,
-                    "conversation_status": conversation_status,
-                    "auth": auth_result,
-                }
+                return finish(
+                    True,
+                    "complete",
+                    message=message,
+                    birth_year=birth_year,
+                    birth_date_saved=True,
+                    conversation_url=conversation_url,
+                )
 
             now = time.time()
-            if clicks < 2 and (clicks == 0 or now - last_click_at >= 0.8):
-                button = _activation_pick_birth_button(page)
-                if button is not None:
-                    try:
-                        button.click()
-                        clicks += 1
-                        last_click_at = now
-                        log(f"[activation] 已点击生日保存按钮 ({clicks}/2)")
-                    except Exception as exc:
-                        return {"ok": False, "reason": f"birth_save_click_failed: {exc}"}
+            if birth_saved:
+                save_phase_deadline = max(save_phase_deadline, birth_saved_at + 20.0)
+            if not birth_saved and birth_button_attempts < 3 and (
+                birth_button_attempts == 0 or now - last_click_at >= 1.0
+            ):
+                found, clicked, mode, click_error = _activation_click_birth_button(page)
+                if found:
+                    birth_button_attempts += 1
+                    last_click_at = now
+                    if clicked:
+                        log(
+                            f"[activation] 已点击生日保存按钮 "
+                            f"({birth_button_attempts}/3, {mode})"
+                        )
+                    else:
+                        last_button_error = click_error
+                        log(
+                            f"[activation] 生日保存按钮点击重试 "
+                            f"{birth_button_attempts}/3: {click_error}"
+                        )
+                        if birth_button_attempts >= 3:
+                            return finish(
+                                False,
+                                "birthday_save",
+                                f"birth_save_click_failed: {last_button_error}",
+                            )
+
+            if (
+                birth_saved
+                and not conversation_created
+                and now - birth_saved_at >= 2.0
+                and message_resubmit_attempts < 3
+                and now >= next_resubmit_at
+            ):
+                message_resubmit_attempts += 1
+                try:
+                    selector, submit_mode = _activation_submit_message(
+                        page, message, prefer_button=message_resubmit_attempts > 1
+                    )
+                    message_submissions += 1
+                    last_resubmit_error = ""
+                    next_resubmit_at = now + 4.0
+                    log(
+                        f"[activation] 生日保存后补交首条消息 "
+                        f"({message_resubmit_attempts}/3) selector={selector} mode={submit_mode}"
+                    )
+                except Exception as exc:
+                    last_resubmit_error = str(exc)[:160]
+                    next_resubmit_at = now + 1.0
+                    log(
+                        f"[activation] 补交消息等待页面恢复 "
+                        f"{message_resubmit_attempts}/3: {last_resubmit_error}"
+                    )
+                    if (
+                        (not resubmit_reload_done)
+                        and message_resubmit_attempts >= 2
+                        and "chat input" in last_resubmit_error.lower()
+                    ):
+                        resubmit_reload_done = True
+                        soft_reload_grok("chat_missing_after_birth")
+                        next_resubmit_at = time.time() + 1.5
             sleep_with_cancel(0.15, cancel_callback)
 
         if birth_status is None:
-            return {"ok": False, "reason": "set_birth_date_timeout"}
-        return {"ok": False, "reason": "conversation_creation_timeout", "birth_status": birth_status}
+            return finish(False, "birthday_save", "set_birth_date_timeout")
+        if last_resubmit_error and message_submissions <= message_submit_attempts:
+            return finish(
+                False,
+                "message_resubmit",
+                f"chat_resubmit_failed: {last_resubmit_error}",
+            )
+        return finish(False, "conversation", "conversation_creation_timeout")
     except RegistrationCancelled:
         raise
     except Exception as exc:
-        return {"ok": False, "reason": f"web_activation_exception: {exc}"}
+        return finish(False, "exception", f"web_activation_exception: {exc}")
     finally:
         if listener_started:
             try:
@@ -3734,15 +4396,75 @@ def activate_grok_web_account(page, log_callback=None, cancel_callback=None, tim
 # ── wait_for_sso_cookie ──
 
 
-def wait_for_sso_cookie(timeout=120, log_callback=None, cancel_callback=None):
-    deadline = time.time() + timeout
+def _url_is_accounts_xai(url: str) -> bool:
+    try:
+        host = str(urllib.parse.urlparse(str(url or "")).hostname or "").lower()
+    except Exception:
+        host = ""
+    return host == "accounts.x.ai" or host.endswith(".accounts.x.ai")
+
+
+def wait_for_sso_cookie(
+    timeout=None,
+    log_callback=None,
+    cancel_callback=None,
+    *,
+    force_grok_nav_after_sec=None,
+):
+    """Wait until SSO cookie exists AND the tab is on grok.com.
+
+    If SSO appears but the tab stays on accounts.x.ai past a short grace period,
+    force a single navigation to https://grok.com/ so web activation can run.
+    Natural redirect is preferred; force-nav is a success-path recovery only.
+    """
+    explicit_timeout = timeout is not None
+    try:
+        base_timeout = float(
+            timeout
+            if explicit_timeout
+            else config.get("sso_timeout_base", 240)
+        )
+    except (TypeError, ValueError):
+        base_timeout = 240.0
+    base_timeout = max(5.0, base_timeout)
+    if explicit_timeout:
+        # Caller-provided timeout is a hard cap (tests / one-off waits).
+        max_timeout = base_timeout
+    else:
+        try:
+            max_timeout = float(
+                config.get("sso_timeout_max", max(base_timeout, 480)) or base_timeout
+            )
+        except (TypeError, ValueError):
+            max_timeout = max(base_timeout, 480.0)
+        max_timeout = max(base_timeout, max_timeout)
+    if force_grok_nav_after_sec is None:
+        try:
+            force_after = float(config.get("sso_force_grok_nav_after_sec", 20) or 0)
+        except (TypeError, ValueError):
+            force_after = 20.0
+    else:
+        try:
+            force_after = float(force_grok_nav_after_sec)
+        except (TypeError, ValueError):
+            force_after = 20.0
+
+    start = time.time()
+    deadline = start + base_timeout
     last_seen_names = set()
     last_submit_retry = 0.0
     last_cf_retry_at = 0.0
     sso_value = ""
     sso_domain = ""
+    sso_seen_at = 0.0
     logged_sso = False
+    forced_nav = False
+    hydrate_meta: dict = {}
     last_url = ""
+    try:
+        settle_sec = float(config.get("sso_force_grok_nav_settle_sec", 5) or 0)
+    except (TypeError, ValueError):
+        settle_sec = 5.0
 
     while time.time() < deadline:
         raise_if_cancelled(cancel_callback)
@@ -3848,6 +4570,10 @@ return String(cfInput.value || '').trim().length;
                     sso_domain = domain
 
             if sso_value:
+                if not sso_seen_at:
+                    sso_seen_at = now
+                    # Once SSO is proven, allow waiting longer for Grok redirect / force-nav.
+                    deadline = max(deadline, min(start + max_timeout, sso_seen_at + max_timeout))
                 if not logged_sso and log_callback:
                     log_callback(
                         "[*] 已获取到 sso cookie，等待注册页自然跳转到 Grok"
@@ -3856,8 +4582,72 @@ return String(cfInput.value || '').trim().length;
                     logged_sso = True
                 if _activation_url_is_grok(last_url):
                     if log_callback:
-                        log_callback(f"[*] 注册页已自然进入 Grok: {last_url}")
+                        if forced_nav:
+                            log_callback(f"[*] 注册页已进入 Grok: {last_url}")
+                        else:
+                            log_callback(f"[*] 注册页已自然进入 Grok: {last_url}")
+                    _LAST_SSO_WAIT_META.clear()
+                    _LAST_SSO_WAIT_META.update(
+                        {
+                            "forced_nav": bool(forced_nav),
+                            "entry_path": "forced" if forced_nav else "natural",
+                            "hydrate": dict(hydrate_meta or {}),
+                        }
+                    )
                     return sso_value
+                # SSO ready but still parked on accounts.x.ai — force Grok once.
+                if (
+                    force_after > 0
+                    and not forced_nav
+                    and sso_seen_at
+                    and (now - sso_seen_at) >= force_after
+                    and _url_is_accounts_xai(last_url)
+                ):
+                    if log_callback:
+                        log_callback(
+                            f"[*] sso 已就绪但未自然跳转"
+                            f"（停留 {last_url or 'accounts.x.ai'} "
+                            f"{int(now - sso_seen_at)}s），强制打开 Grok"
+                        )
+                    try:
+                        page.get("https://grok.com/")
+                        forced_nav = True
+                        try:
+                            last_url = str(page.url or "")
+                        except Exception:
+                            last_url = "https://grok.com/"
+                        if _activation_url_is_grok(last_url):
+                            if log_callback:
+                                log_callback(
+                                    f"[*] 注册页已进入 Grok: {last_url}，等待 SPA 水合"
+                                )
+                            remaining = max(5.0, deadline - time.time())
+                            hydrate_meta = _hydrate_after_force_nav(
+                                page,
+                                log_callback=log_callback,
+                                cancel_callback=cancel_callback,
+                                settle_sec=settle_sec,
+                                ready_timeout=min(25.0, remaining),
+                            )
+                            try:
+                                last_url = str(page.url or last_url)
+                            except Exception:
+                                pass
+                            _LAST_SSO_WAIT_META.clear()
+                            _LAST_SSO_WAIT_META.update(
+                                {
+                                    "forced_nav": True,
+                                    "entry_path": "forced",
+                                    "hydrate": dict(hydrate_meta or {}),
+                                }
+                            )
+                            if log_callback:
+                                log_callback(f"[*] 注册页已进入 Grok: {last_url}")
+                            return sso_value
+                    except Exception as nav_exc:
+                        if log_callback:
+                            log_callback(f"[Debug] 强制打开 Grok 失败: {nav_exc}")
+                        forced_nav = True  # do not tight-loop retries
         except PageDisconnectedError:
             refresh_active_page()
         except Exception:
@@ -3865,9 +4655,20 @@ return String(cfInput.value || '').trim().length;
 
         human_sleep(1, cancel_callback)
 
+    _LAST_SSO_WAIT_META.clear()
+    _LAST_SSO_WAIT_META.update(
+        {
+            "forced_nav": bool(forced_nav),
+            "entry_path": "forced" if forced_nav else "natural",
+            "hydrate": dict(hydrate_meta or {}),
+            "timed_out": True,
+        }
+    )
     raise Exception(
-        "等待超时：未完成 sso + Grok 自然跳转。"
+        "等待超时：未完成 sso + Grok 跳转。"
         f"已看到 cookies: {sorted(last_seen_names)}，最后URL: {last_url}"
+        f"，forced_nav={'yes' if forced_nav else 'no'}"
+        f"{'，sso=yes' if sso_value else '，sso=no'}"
     )
 
 
@@ -4072,7 +4873,7 @@ def login_and_get_sso(email, password, log_callback=None, cancel_callback=None):
     """完整登录流程：打开页 → 填邮箱密码 → Turnstile → 等 sso cookie。"""
     open_login_page(log_callback=log_callback, cancel_callback=cancel_callback)
     fill_login_and_submit(email, password, log_callback=log_callback, cancel_callback=cancel_callback)
-    sso = wait_for_sso_cookie(timeout=120, log_callback=log_callback, cancel_callback=cancel_callback)
+    sso = wait_for_sso_cookie(log_callback=log_callback, cancel_callback=cancel_callback)
     return sso
 
 
@@ -4902,10 +5703,12 @@ class GrokRegisterGUI:
             log_callback=logf,
             cancel_callback=self.should_stop,
         )
+        record_web_activation_audit(email, activation, log_callback=logf)
         if not activation.get("ok"):
             reason = str(activation.get("reason") or "web_activation_failed")
             detail = (
                 f"web_activation:{reason}:"
+                f"stage={activation.get('stage', 'unknown')}:"
                 f"session={activation.get('auth_session_status', 0)}:"
                 f"settings={activation.get('user_settings_status', 0)}:"
                 f"dom={activation.get('dom_state', 'unknown')}"
@@ -4980,10 +5783,50 @@ class GrokRegisterGUI:
             rejection.mint_result = cpa_result
             raise rejection
 
+        # 入库才算成功: 需要真实 xai-*.json + healthy（可用 config 放宽）
+        require_cpa_file = bool(
+            config.get("registration_success_requires_cpa_file", True)
+        )
+        require_healthy = bool(
+            config.get("registration_success_requires_healthy", True)
+        )
+        if config.get("cpa_mint_required", False):
+            require_cpa_file = True
+        cpa_path = str(
+            cpa_result.get("path") or cpa_result.get("cpa_path") or ""
+        ).strip()
         health = cpa_result.get("health") if isinstance(cpa_result, dict) else None
-        classification = health.get("classification") if isinstance(health, dict) else "unknown"
+        if isinstance(health, dict) and health.get("classification"):
+            classification = str(health.get("classification") or "").strip() or "unknown"
+            health_present = True
+        else:
+            classification = "missing"
+            health_present = False
+
+        if require_cpa_file and not cpa_path:
+            detail = str(
+                cpa_result.get("auth_code_error")
+                or cpa_result.get("error")
+                or "no_cpa_file"
+            )[:200]
+            try:
+                mark_error(email, password, reason=f"no_cpa_file:{detail}")
+            except Exception:
+                pass
+            logf(f"[-] 未入库，不记注册成功: {email} (no_cpa_file:{detail})")
+            raise Exception(f"CPA 未入库: {detail}")
+
+        if require_healthy and (not health_present or classification != "healthy"):
+            detail = classification if health_present else "health_missing"
+            try:
+                mark_error(email, password, reason=f"health_not_healthy:{detail}")
+            except Exception:
+                pass
+            logf(f"[-] 未入库，不记注册成功: {email} (health_not_healthy:{detail})")
+            raise Exception(f"健康未通过: {detail}")
+
         if classification != "healthy":
-            logf(f"[health] 非明确权限拒绝，按配置保留: {classification}")
+            logf(f"[health] 非 healthy，按宽松策略保留: {classification}")
 
         with self.stats_lock:
             line = f"{email}----{password}----{sso}\n"
@@ -4998,10 +5841,12 @@ class GrokRegisterGUI:
         if cookies and PERF_FLAGS.get("cookie_snapshot", True):
             save_exported_cookies_snapshot(cookies, "success", email)
         add_token_to_grok2api_pools(sso, email=email, log_callback=logf)
+        if cpa_path:
+            logf(f"[+] 入库成功 path={cpa_path}")
         if classification == "healthy":
             logf(f"[+] 注册成功并通过健康门: {email}")
         else:
-            logf(f"[+] 注册成功，健康结果按策略保留: {email} ({classification})")
+            logf(f"[+] 注册成功（宽松策略）: {email} ({classification})")
         return result_record
 
     def _worker_loop(self, worker_id, total, task_queue):

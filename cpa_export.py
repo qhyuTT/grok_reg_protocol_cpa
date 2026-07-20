@@ -267,6 +267,17 @@ def export_cpa_xai_for_account(
         # Backward compatibility: the old auth-code-only switch now controls
         # the pipeline-wide policy when the new key is absent.
         required_referrer = "grok-build" if auth_code_require_referrer else ""
+    # Device-code cannot stamp JWT referrer; skip it under referrer policy.
+    skip_device_when_referrer_required = bool(
+        cfg.get("cpa_skip_device_when_referrer_required", True)
+    )
+    dump_consent_on_fail = bool(cfg.get("cpa_auth_code_dump_consent_on_fail", False))
+    auth_code_dump_consent_dir = None
+    if dump_consent_on_fail:
+        raw_dump = str(cfg.get("cpa_auth_code_dump_consent_dir") or "").strip()
+        if not raw_dump:
+            raw_dump = str(out_dir / "consent_debug")
+        auth_code_dump_consent_dir = raw_dump
     health_probe_delays = _parse_health_delays(
         cfg.get("registration_health_probe_delays_sec", [10, 20, 45])
     )
@@ -343,6 +354,8 @@ def export_cpa_xai_for_account(
         auth_code_timeout_sec=auth_code_timeout,
         auth_code_require_referrer=auth_code_require_referrer,
         required_referrer=required_referrer,
+        skip_device_when_referrer_required=skip_device_when_referrer_required,
+        auth_code_dump_consent_dir=auth_code_dump_consent_dir,
         health_check=health_enabled,
         health_probe_delays=health_probe_delays,
         health_reject_inconclusive=health_reject_inconclusive,
